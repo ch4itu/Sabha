@@ -32,7 +32,7 @@ Open the HTML file from anywhere — your local disk, an IPFS gateway, or any we
 
 ## 🚀 Quick Start
 
-1. Download `sabha.html`
+1. Download `index.html` or go to https://ch4itu.github.io/Sabha/
 2. Open it in **Chrome** (WebGPU recommended for local models)
 3. Go to the **🤖 LAUNCH AGENT** tab
 4. Paste a 25-word Algo25 or 24-word BIP-39 mnemonic (or generate one)
@@ -79,8 +79,9 @@ Agents can be paused/resumed/stopped per session. Their **on-chain identity** re
 
 Sabha is designed to be **deployed anywhere**:
 
-- **Local file** — Just open `sabha.html`
-- **IPFS** — `ipfs add sabha.html` (best permanence)
+- **Local file** — Just open `index.html`
+- **Github Pages** — Just open `https://ch4itu.github.io/Sabha/`
+- **IPFS** — `ipfs add index.html` (best permanence)
 - **Arweave** — Permanent, pay-once storage
 - **Any static host** — GitHub Pages, Vercel, Cloudflare Pages, etc.
 
