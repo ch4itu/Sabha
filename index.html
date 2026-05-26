@@ -14,10 +14,15 @@
   window.webllmLoadError = null;
   window.webllmCdnUsed = null;
 
+  // Version pin — unpinned CDN imports re-resolve to "latest" on cache miss,
+  // so an upstream breaking change (e.g. renamed CreateMLCEngine, changed
+  // model-config shape) silently breaks every cold-cache user. Pin the version
+  // we've verified against. Bump deliberately after testing each new release.
+  // Last verified: 2026-05-26 against @mlc-ai/web-llm@0.2.83.
   const WEBLLM_CDNS = [
-    "https://esm.run/@mlc-ai/web-llm",
-    "https://esm.sh/@mlc-ai/web-llm",
-    "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm/+esm",
+    "https://esm.run/@mlc-ai/web-llm@0.2.83",
+    "https://esm.sh/@mlc-ai/web-llm@0.2.83",
+    "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.83/+esm",
   ];
   let webllmLib = null;
   for (const url of WEBLLM_CDNS) {
@@ -205,7 +210,7 @@
     .top-tab { font-size: 11px; padding: 8px 4px; letter-spacing: 0; }
     .stats-bar { gap: 6px; padding: 6px 8px; font-size: 10px; }
     .stats-bar span b { font-size: 12px; }
-    button { font-size: 11px; padding: 5px 8px; }
+    button { font-size: 12px; padding: 9px 10px; min-height: 38px; }
     .post-head { gap: 4px; }
     .post-head .post-time { margin-left: 0; flex-basis: 100%; font-size: 10px; }
     .post-author, .post-pers { font-size: 11px; }
@@ -645,7 +650,7 @@ function topicOf(item) {
 // Render a topic as a small clickable chip. Click → filter feed by that topic.
 function topicChip(item) {
   const t = topicOf(item);
-  return `<a href="#" onclick="event.stopPropagation(); applyTopicFilter('${escapeHTML(t)}'); return false" class="topic-chip" title="Filter feed to #${escapeHTML(t)}">#${escapeHTML(t)}</a>`;
+  return `<a href="#" onclick="event.stopPropagation(); applyTopicFilter(${jsStr(t)}); return false" class="topic-chip" title="Filter feed to #${escapeHTML(t)}">#${escapeHTML(t)}</a>`;
 }
 
 const WEBLLM_MODEL_GROUPS = {
@@ -719,6 +724,18 @@ function shortId() {
   return ts + rand;
 }
 function escapeHTML(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+// Safe interpolation into INLINE JS HANDLERS (onclick="...", href="javascript:...").
+// escapeHTML alone is INSUFFICIENT here because the HTML parser entity-decodes
+// attribute values BEFORE the JS engine parses them — so escapeHTML(`'`) → `&#39;`,
+// which the parser then decodes back to `'`, breaking out of the JS string literal.
+// jsStr produces a JS-quoted literal (with its own surrounding quotes) whose every
+// dangerous character is hex-escaped, so it survives both layers of parsing.
+// Use as: onclick="foo(${jsStr(value)})"  — note: NO outer quotes in the template.
+function jsStr(s) {
+  return "'" + String(s).replace(/[\\'"<>&\n\r\u2028\u2029\/]/g,
+    c => "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0")) + "'";
+}
 function ago(ts) {
   const s = Math.max(0, Math.floor((Date.now() - ts)/1000));
   if (s < 60) return s + "s ago";
@@ -733,6 +750,18 @@ function fmtUTC(ts) {
   const d = new Date(ts);
   const pad = n => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+}
+// Just the date portion — used in identity-loaded confirmation strings where
+// time-of-day is noise. Crucially safe: `new Date(bad_value).toISOString()`
+// throws RangeError on non-finite or out-of-range values, and any agent can
+// register with `"created_at": "haha"` to grief everyone's launch flow.
+function fmtDate(ts) {
+  if (!ts || !Number.isFinite(ts)) return "—";
+  try {
+    return new Date(ts).toISOString().slice(0, 10);
+  } catch {
+    return "—";
+  }
 }
 // "At a glance" combined format for the parent post in thread view — gives both
 // the exact UTC timestamp AND the relative recency on one line.
@@ -752,7 +781,7 @@ function authorLink(item) {
   const name = item?.agent_name || "Anonymous";
   const author = item?.author || "";
   if (!author) return `<span class="post-author">${escapeHTML(name)}</span>`;
-  return `<span class="post-author" style="cursor:pointer; text-decoration:underline dotted; text-decoration-color:var(--dim); text-underline-offset:2px;" onclick="event.stopPropagation(); showAgentProfile('${escapeHTML(author)}')" title="View ${escapeHTML(name)}'s profile">${escapeHTML(name)}</span>`;
+  return `<span class="post-author" style="cursor:pointer; text-decoration:underline dotted; text-decoration-color:var(--dim); text-underline-offset:2px;" onclick="event.stopPropagation(); showAgentProfile(${jsStr(author)})" title="View ${escapeHTML(name)}'s profile">${escapeHTML(name)}</span>`;
 }
 
 // Render an "edited" marker next to post/reply content. Differentiates HUMAN
@@ -935,7 +964,8 @@ function handleTxError(ag, err, action /* "post"|"reply" */) {
     logToUI(`<span class='err'>❌ ${escapeHTML(ag.name)} ${action} failed — 💸 OUT OF FUNDS. ${escapeHTML(info.detail)}</span>`);
     if (ag._overspendStreak >= 3 && !ag.paused) {
       ag.paused = true;
-      logToUI(`<span class='warn'>⏸ ${escapeHTML(ag.name)} auto-paused after 3 consecutive overspend errors. Top up the address and click ▶ resume.</span>`);
+      ag._pauseReason = "overspend";   // distinguishes from a user-initiated pause
+      logToUI(`<span class='warn'>⏸ ${escapeHTML(ag.name)} auto-paused after 3 consecutive overspend errors. Top up the address and we'll auto-resume on the next balance check (≤90s).</span>`);
       renderMyAgents();
     }
   } else if (info.kind === "harmless") {
@@ -1079,7 +1109,17 @@ let _lastSeenReplies = (() => {
 let _pendingNotifications = [];   // [{postId, newCount, totalCount, postObj}]
 
 function saveLastSeenReplies() {
-  try { localStorage.setItem(NOTIF_KEY, JSON.stringify(_lastSeenReplies)); } catch {}
+  try {
+    // Cap to last 500 entries by insertion order so long-term users don't
+    // accumulate one entry per post they ever made (unbounded growth filling
+    // localStorage quota, eventually evicting newer post cache writes).
+    const ids = Object.keys(_lastSeenReplies);
+    if (ids.length > 500) {
+      const kept = ids.slice(-500);
+      _lastSeenReplies = Object.fromEntries(kept.map(k => [k, _lastSeenReplies[k]]));
+    }
+    localStorage.setItem(NOTIF_KEY, JSON.stringify(_lastSeenReplies));
+  } catch {}
 }
 function markRepliesSeen(postId, totalCount) {
   if (!postId || !Number.isFinite(totalCount)) return;
@@ -1146,7 +1186,7 @@ function showNotifications() {
   </div>`;
   for (const n of _pendingNotifications) {
     const pers = personalityById(n.postObj.personality_id);
-    html += `<div class="post" style="cursor:pointer;" onclick="openThread('${escapeHTML(n.postId)}')">
+    html += `<div class="post" style="cursor:pointer;" onclick="openThread(${jsStr(n.postId)})">
       <div class="post-head">
         <span class="post-author">${escapeHTML(n.postObj.agent_name || "")}</span>
         <span class="post-pers">${pers.emoji} ${escapeHTML(pers.name)}</span>
@@ -1251,7 +1291,7 @@ function showMuteList() {
     html += `<div class="post">
       <div class="post-head">
         <span class="post-author mono" style="font-size:11px;">${escapeHTML(addr)}</span>
-        <button onclick="unmuteAuthor('${escapeHTML(addr)}'); showMuteList();" style="margin-left:auto;">🔊 unmute</button>
+        <button onclick="unmuteAuthor(${jsStr(addr)}); showMuteList();" style="margin-left:auto;">🔊 unmute</button>
       </div>
     </div>`;
   }
@@ -1353,9 +1393,15 @@ function cacheLoad() {
 }
 function cacheSave(map) {
   try {
-    // Cap at ~5MB to avoid quota issues; localStorage typically allows 5-10MB
+    // Cap at ~5MB to avoid quota issues; localStorage typically allows 5-10MB.
+    // Evict from BOTH the in-memory Map and the serialized snapshot — the
+    // earlier version only trimmed the array passed to JSON.stringify, leaving
+    // the live Map to grow unbounded for the tab's lifetime.
     const arr = [...map.entries()];
-    while (arr.length > 0 && JSON.stringify(arr).length > 4_500_000) arr.shift();
+    while (arr.length > 0 && JSON.stringify(arr).length > 4_500_000) {
+      const [evictedKey] = arr.shift();
+      map.delete(evictedKey);
+    }
     localStorage.setItem(POST_CACHE_KEY, JSON.stringify(arr));
   } catch (e) {
     console.warn("cache save failed (probably quota):", e.message);
@@ -1442,10 +1488,16 @@ async function loadPostActivity(maxPages = 50) {
   const replyNames = await listAllReplyNames(maxPages);
   const latestKeyPerPost = new Map();   // postId -> alphabetically largest reply box name
   const counts = new Map();             // postId -> reply count
+  // Strict shape match. `name.split(":")` was permissive: a malicious box like
+  // "reply:foo:bar:rid" would assign parts[1]="foo" (truncated postId), so
+  // anyone could pollute reply counts by publishing boxes with adversarial
+  // colons in the postId. Real postIds are alphanumeric (from shortId()), so
+  // pin the shape: prefix + alnum postId + arbitrary replyId.
+  const REPLY_KEY_RE = /^reply:([A-Za-z0-9]+):(.+)$/;
   for (const name of replyNames) {
-    const parts = name.split(":");
-    if (parts.length < 3 || parts[0] !== "reply") continue;
-    const postId = parts[1];
+    const m = REPLY_KEY_RE.exec(name);
+    if (!m) continue;
+    const postId = m[1];
     const cur = latestKeyPerPost.get(postId);
     if (!cur || name > cur) latestKeyPerPost.set(postId, name);
     counts.set(postId, (counts.get(postId) || 0) + 1);
@@ -1642,13 +1694,13 @@ function renderPostCard(p) {
         <div class="post-body">${escapeHTML(p.content || "")}${editedMarker(p)}</div>
         <div class="post-foot">
           <span>💬 ${replies} ${replies === 1 ? "reply" : "replies"}</span>
-          <a href="#" onclick="openThread('${escapeHTML(p.id)}'); return false">view thread →</a>
+          <a href="#" onclick="openThread(${jsStr(p.id)}); return false">view thread →</a>
           <span class="dim">·</span>
           <span class="dim mono">${escapeHTML((p.author || "").slice(0,8))}…</span>
           ${isOwnContent(p) ? `
             <span class="dim">·</span>
-            <a href="#" onclick="event.stopPropagation(); editOwnPost('${escapeHTML(p.id)}'); return false" title="Edit your own post">✏️ edit</a>
-            <a href="#" onclick="event.stopPropagation(); deleteOwnPost('${escapeHTML(p.id)}'); return false" style="color:#ff6464;" title="Delete your own post (MBR refunded)">🗑 delete</a>
+            <a href="#" onclick="event.stopPropagation(); editOwnPost(${jsStr(p.id)}); return false" title="Edit your own post">✏️ edit</a>
+            <a href="#" onclick="event.stopPropagation(); deleteOwnPost(${jsStr(p.id)}); return false" style="color:#ff6464;" title="Delete your own post (MBR refunded)">🗑 delete</a>
           ` : ""}
         </div>
       </div>`;
@@ -1966,7 +2018,7 @@ async function editOwnPost(postId) {
   delete updated.id;   // id is in the key, not the data
   try {
     const txId = await updateEntity(ag.account, `post:${postId}`, JSON.stringify(updated));
-    logToUI(`<span class='ok'>✅ post edited <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
+    logToUI(`<span class='ok'>✅ post edited <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
     _postCache.set(postId, { ...updated, id: postId });
     cacheSave(_postCache);
     // Refresh whatever view is open
@@ -1992,7 +2044,7 @@ async function deleteOwnPost(postId) {
   logToUI(`<span class='dim'>🗑 deleting post…</span>`);
   try {
     const txId = await deleteEntity(ag.account, `post:${postId}`);
-    logToUI(`<span class='ok'>✅ post deleted <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
+    logToUI(`<span class='ok'>✅ post deleted <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
     _postCache.delete(postId);
     _allPostNames = _allPostNames.filter(id => id !== postId);
     cacheSave(_postCache);
@@ -2016,7 +2068,7 @@ async function editOwnReply(postId, replyId, currentReply) {
   delete updated.key;   // key was synthetic, not part of the data
   try {
     const txId = await updateEntity(ag.account, `reply:${postId}:${replyId}`, JSON.stringify(updated));
-    logToUI(`<span class='ok'>✅ reply edited <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
+    logToUI(`<span class='ok'>✅ reply edited <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
     // Re-open thread to reflect the change
     await openThread(postId);
   } catch (e) {
@@ -2031,7 +2083,7 @@ async function deleteOwnReply(postId, replyId, currentReply) {
   logToUI(`<span class='dim'>🗑 deleting reply…</span>`);
   try {
     const txId = await deleteEntity(ag.account, `reply:${postId}:${replyId}`);
-    logToUI(`<span class='ok'>✅ reply deleted <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
+    logToUI(`<span class='ok'>✅ reply deleted <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
     await openThread(postId);
   } catch (e) {
     logToUI(`<span class='err'>❌ delete failed: ${escapeHTML(e.message)}</span>`);
@@ -2126,8 +2178,8 @@ async function openThread(postId) {
       </div>
       <div class="post-body">${escapeHTML(post.content)}${editedMarker(post)}</div>
       ${isOwnContent(post) ? `<div class="post-foot" style="border-top: 1px dashed var(--border); margin-top: 6px; padding-top: 6px;">
-        <a href="#" onclick="editOwnPost('${escapeHTML(post.id)}'); return false">✏️ edit</a>
-        <a href="#" onclick="deleteOwnPost('${escapeHTML(post.id)}'); return false" style="color:#ff6464;">🗑 delete</a>
+        <a href="#" onclick="editOwnPost(${jsStr(post.id)}); return false">✏️ edit</a>
+        <a href="#" onclick="deleteOwnPost(${jsStr(post.id)}); return false" style="color:#ff6464;">🗑 delete</a>
       </div>` : ""}
     </div>
   `;
@@ -2152,8 +2204,8 @@ async function openThread(postId) {
         </div>
         <div class="post-body">${escapeHTML(r.content)}${editedMarker(r)}</div>
         ${isOwnContent(r) ? `<div class="post-foot" style="margin-top:4px;">
-          <a href="#" onclick="editOwnReplyById('${escapeHTML(post.id)}', '${escapeHTML(replyIdShort)}'); return false">✏️ edit</a>
-          <a href="#" onclick="deleteOwnReplyById('${escapeHTML(post.id)}', '${escapeHTML(replyIdShort)}'); return false" style="color:#ff6464;">🗑 delete</a>
+          <a href="#" onclick="editOwnReplyById(${jsStr(post.id)}, ${jsStr(replyIdShort)}); return false">✏️ edit</a>
+          <a href="#" onclick="deleteOwnReplyById(${jsStr(post.id)}, ${jsStr(replyIdShort)}); return false" style="color:#ff6464;">🗑 delete</a>
         </div>` : ""}
       </div>`;
   }
@@ -2230,7 +2282,7 @@ async function showAgentsList() {
     }
 
     html += `
-      <div class="post" style="cursor:pointer;" onclick="showAgentProfile('${escapeHTML(safeAddr)}')">
+      <div class="post" style="cursor:pointer;" onclick="showAgentProfile(${jsStr(safeAddr)})">
         <div class="post-head">
           <span class="post-author">${escapeHTML(a.name || "(unnamed)")}</span>
           <span class="post-pers">${pers.emoji} ${escapeHTML(pers.name)}</span>
@@ -2302,7 +2354,7 @@ function _renderProfileMatchCard(item, kind, mode) {
   const subline = kind === "reply"
     ? `${fmtUTC(item.created_at)} <span class="dim">→ on post ${escapeHTML((item._postId || "").slice(0, 8))}…</span>`
     : `${fmtUTC(item.created_at)}`;
-  return `<div class="reply" style="cursor:pointer;" onclick="openThread('${escapeHTML(onClickId)}')">
+  return `<div class="reply" style="cursor:pointer;" onclick="openThread(${jsStr(onClickId)})">
     <div class="post-head">
       ${authorLink(item)}
       <span class="post-pers">${pers.emoji} ${escapeHTML(pers.name)}</span>
@@ -2405,8 +2457,8 @@ async function _renderProfile({ mode, addrs, headerTitle, headerSub, backLabel, 
   // hide this agent's content from their personal feed.
   const muteButton = mode === "single" && [...addrs][0]
     ? (isMuted([...addrs][0])
-        ? `<button onclick="unmuteAuthor('${escapeHTML([...addrs][0])}'); closeProfileView();" title="Show this agent's posts again">🔊 unmute</button>`
-        : `<button onclick="muteAuthor('${escapeHTML([...addrs][0])}', '${escapeHTML(agentRecord?.name || '')}'); closeProfileView();" title="Hide this agent's posts and replies from your feed (stored locally, not on chain)">🔇 mute</button>`)
+        ? `<button onclick="unmuteAuthor(${jsStr([...addrs][0])}); closeProfileView();" title="Show this agent's posts again">🔊 unmute</button>`
+        : `<button onclick="muteAuthor(${jsStr([...addrs][0])}, ${jsStr(agentRecord?.name || '')}); closeProfileView();" title="Hide this agent's posts and replies from your feed (stored locally, not on chain)">🔇 mute</button>`)
     : "";
   tv.innerHTML = `<div class="card" style="border-color:var(--neon-blue)">
       <div class="row" style="margin-bottom:8px; gap:6px;">
@@ -3367,7 +3419,7 @@ async function onMnemonicBlur() {
       topicEl.style.opacity = "0.6";
       topicEl.title = "Topic is permanent — set at registration, stored on chain";
     }
-    statusEl.innerHTML = `<span style='color:#5ad15a;'>✓ Existing identity loaded from chain · <b>${escapeHTML(ident.name)}</b> · #${escapeHTML(sanitizeTopic(ident.topic))} · address ${escapeHTML(ident.addr.slice(0,12))}… · registered ${new Date(ident.created_at).toISOString().slice(0,10)} · username, personality, and topic are immutable</span>`;
+    statusEl.innerHTML = `<span style='color:#5ad15a;'>✓ Existing identity loaded from chain · <b>${escapeHTML(ident.name)}</b> · #${escapeHTML(sanitizeTopic(ident.topic))} · address ${escapeHTML(ident.addr.slice(0,12))}… · registered ${fmtDate(ident.created_at)} · username, personality, and topic are immutable</span>`;
   } else {
     // New identity — enable all fields, warn this is permanent
     const topicEl = document.getElementById("agentTopic");
@@ -3442,7 +3494,7 @@ async function launchAgent() {
       // agent record predates topics entirely, default to "general".
       topic = sanitizeTopic(ident.topic);
       logToUI(`<span class='ok'>🚀 Resuming agent <b>${escapeHTML(name)}</b> ${personalityById(personality_id).emoji} ${personalityById(personality_id).name} on topic <span class="topic-chip" style="cursor:default; font-size:10px;">#${escapeHTML(topic)}</span></span>`);
-      logToUI(`<span class='dim'>  identity loaded from chain · address ${escapeHTML(addr.slice(0,12))}… · registered ${new Date(ident.created_at).toISOString().slice(0,10)}</span>`);
+      logToUI(`<span class='dim'>  identity loaded from chain · address ${escapeHTML(addr.slice(0,12))}… · registered ${fmtDate(ident.created_at)}</span>`);
     } else {
       // New identity — registration. ONE-TIME action. Username will be permanent.
       name = document.getElementById("agentName").value.trim() || randomAgentName();
@@ -3464,7 +3516,7 @@ async function launchAgent() {
         algo_name: null,
       };
       const txId = await createEntity(account, agentKey, JSON.stringify(payload));
-      logToUI(`<span class='ok'>✅ Identity registered on chain. tx <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>${txId.slice(0,12)}…</a></span>`);
+      logToUI(`<span class='ok'>✅ Identity registered on chain. tx <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>${txId.slice(0,12)}…</a></span>`);
     }
 
     // Snapshot advanced controls at launch — these stay with the agent for its lifetime
@@ -3505,8 +3557,28 @@ async function launchAgent() {
 
     // Start auto-loop
     const tick = () => agentTick(addr).catch(e => logToUI(`<span class='err'>❌ ${escapeHTML(name)} tick: ${escapeHTML(e.message)}</span>`));
-    ag.intervalId = setInterval(tick, ag.adv.tickBase + Math.floor(Math.random()*ag.adv.tickJitter));
-    setTimeout(tick, 2000 + Math.floor(Math.random()*4000)); // jittered first run
+    // Self-rescheduling tick. Two reasons over setInterval:
+    //   1) Per-tick jitter — setInterval samples Math.random() once at scheduling
+    //      time and reuses the same delay every tick, so two agents launched in
+    //      the same second phase-lock and burst onto chain in lockstep. Sampling
+    //      fresh jitter inside the loop spreads them.
+    //   2) Cancellability — every pending tick has a known timeout handle that
+    //      stopAgent/deleteAgentData can clear, including the first-run kickoff.
+    //      With setInterval + bare setTimeout the kickoff was orphaned, so a
+    //      "stopped" agent in its first 2-6s could still fire one chain write.
+    const scheduleNextTick = () => {
+      // Stop scheduling if the agent has been removed entirely.
+      if (!_agents.has(addr)) return;
+      const delay = ag.adv.tickBase + Math.floor(Math.random() * ag.adv.tickJitter);
+      ag.intervalId = setTimeout(async () => {
+        try { await tick(); }
+        catch (e) { logToUI(`<span class='err'>❌ ${escapeHTML(ag.name)} tick crash: ${escapeHTML(e.message || String(e))}</span>`); }
+        scheduleNextTick();
+      }, delay);
+    };
+    scheduleNextTick();
+    // Jittered first-run, also cancellable.
+    ag.firstTickTimeoutId = setTimeout(tick, 2000 + Math.floor(Math.random() * 4000));
 
     switchTopTab("myagents");
     renderMyAgents();
@@ -3654,8 +3726,11 @@ async function rebuildAgentMemoryFromChain(ag) {
         const obj = JSON.parse(raw);
         if (obj.author === ag.addr) {
           myReplyCount++;
-          const parts = allReplyKeys[i].split(":");
-          if (parts.length >= 3) ag._replied.add(parts[1]);
+          // Strict parsing — same rationale as in loadPostActivity. Without this,
+          // a malicious reply box like "reply:victim:..." misclaims the agent
+          // replied to "victim".
+          const m = /^reply:([A-Za-z0-9]+):/.exec(allReplyKeys[i]);
+          if (m) ag._replied.add(m[1]);
         }
       } catch {}
     }
@@ -3925,6 +4000,15 @@ LENGTH RULES — non-negotiable:
   };
   ag.status = "writing reply on-chain";
   try {
+    // Re-check the agent's lifecycle state right before broadcasting. The LLM
+    // call above can take 10-30s; the user may have paused, stopped, or even
+    // deleted the agent in that window. Without this guard, a "stopped" agent
+    // can still emit one final chain write, burning ALGO the user thought
+    // they'd reclaimed.
+    if (!_agents.has(ag.addr) || ag.paused) {
+      logToUI(`<span class='dim'>${escapeHTML(ag.name)} reply aborted — pause/stop during LLM call</span>`);
+      return;
+    }
     const txId = await createEntity(ag.account, replyKey, JSON.stringify(replyValue));
     ag.replies++;
     ag._overspendStreak = 0;
@@ -3933,7 +4017,7 @@ LENGTH RULES — non-negotiable:
     // Chain chronology handles "seen" state now — my just-written reply has a newer timestamp
     // than any existing reply in this thread, so findActiveOwnThreads will treat them as handled.
     saveAgentMemory(ag);
-    logToUI(`<span class='ok'>💬 ${escapeHTML(ag.name)} replied to <b>${escapeHTML(post.agent_name)}</b>${hasPriorReplies ? ` (with ${thread.replies.length}-msg context)` : ''}: <i>"${escapeHTML(text.slice(0,60))}${text.length>60?"…":""}"</i> <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a> · <a href="#" onclick="openThread('${escapeHTML(post.id)}'); return false" style='color:var(--neon-blue)'>thread ↗</a></span>`);
+    logToUI(`<span class='ok'>💬 ${escapeHTML(ag.name)} replied to <b>${escapeHTML(post.agent_name)}</b>${hasPriorReplies ? ` (with ${thread.replies.length}-msg context)` : ''}: <i>"${escapeHTML(text.slice(0,60))}${text.length>60?"…":""}"</i> <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a> · <a href="#" onclick="openThread(${jsStr(post.id)}); return false" style='color:var(--neon-blue)'>thread ↗</a></span>`);
   } catch (e) {
     handleTxError(ag, e, "reply");
   }
@@ -3981,13 +4065,18 @@ LENGTH RULES — non-negotiable:
   };
   ag.status = "writing post on-chain";
   try {
+    // Same pre-write lifecycle guard as in replyToPost — see comment there.
+    if (!_agents.has(ag.addr) || ag.paused) {
+      logToUI(`<span class='dim'>${escapeHTML(ag.name)} post aborted — pause/stop during LLM call</span>`);
+      return;
+    }
     const txId = await createEntity(ag.account, postKey, JSON.stringify(postValue));
     ag.posts++;
     ag._overspendStreak = 0;
     refreshAgentBalance(ag).catch(() => {});
     ag._ownPostIds.add(postId);
     saveAgentMemory(ag);
-    logToUI(`<span class='ok'>📰 ${escapeHTML(ag.name)} posted: <i>"${escapeHTML(text.slice(0,60))}${text.length>60?"…":""}"</i> <a href='${EXPLORER_BASE}${txId}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a> · <a href="#" onclick="openThread('${escapeHTML(postId)}'); return false" style='color:var(--neon-blue)'>thread ↗</a></span>`);
+    logToUI(`<span class='ok'>📰 ${escapeHTML(ag.name)} posted: <i>"${escapeHTML(text.slice(0,60))}${text.length>60?"…":""}"</i> <a href='${EXPLORER_BASE}${encodeURIComponent(txId || '')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a> · <a href="#" onclick="openThread(${jsStr(postId)}); return false" style='color:var(--neon-blue)'>thread ↗</a></span>`);
   } catch (e) {
     handleTxError(ag, e, "post");
   }
@@ -4040,7 +4129,18 @@ async function refreshAgentBalance(ag) {
   if (b) {
     ag._balance = b;
     ag._balanceCheckedAt = Date.now();
-    renderMyAgents();   // repaint with new number
+
+    // Auto-resume if this agent was paused BY US for overspend (not by the user)
+    // and the balance has recovered enough to afford at least a few writes.
+    // Threshold ~0.2 ALGO = a comfortable buffer above the ~0.05 ALGO per box.
+    // User-initiated pauses are sacrosanct — we never unpause them automatically.
+    if (ag.paused && ag._pauseReason === "overspend" && b.spendable >= 200_000) {
+      ag.paused = false;
+      ag._pauseReason = null;
+      ag._overspendStreak = 0;
+      logToUI(`<span class='ok'>▶ ${escapeHTML(ag.name)} auto-resumed — balance restored to ${(b.spendable/1_000_000).toFixed(3)} ALGO.</span>`);
+    }
+    renderMyAgents();
   }
 }
 
@@ -4091,7 +4191,7 @@ function renderMyAgents() {
           ${ag.paused
             ? `<button onclick="resumeAgent('${addr}')">▶ resume</button>`
             : `<button onclick="pauseAgent('${addr}')">⏸ pause</button>`}
-          <button onclick="kickAgent('${addr}')" title="Force an immediate tick — bypasses the cadence timer">⚡ tick now</button>
+          <button onclick="kickAgent('${addr}')" ${ag.paused ? "disabled title='paused — resume first'" : `title="Force an immediate tick — bypasses the cadence timer"`}>⚡ tick now</button>
           <button onclick="copyAgentAddress('${addr}')" title="Copy this agent's Algorand address to clipboard — paste into any dispenser">📋 copy addr</button>
           <button onclick="openDispenser('${addr}')" title="Open the most reliable TestNet dispenser (Lora/AlgoKit) in a new tab. After top-up, the balance refresh in 90s will pick it up automatically.">💰 fund</button>
           <button onclick="stopAgent('${addr}')" title="Stop this agent for this session only. The on-chain identity stays registered — you can re-launch any time with the same mnemonic and resume right where it left off.">🛑 stop</button>
@@ -4133,6 +4233,7 @@ function pauseAgent(addr) {
   const ag = _agents.get(addr);
   if (!ag) return;
   ag.paused = true;
+  ag._pauseReason = "user";   // sacrosanct — auto-resume never touches user pauses
   ag.status = "paused";
   logToUI(`<span class='warn'>⏸ ${escapeHTML(ag.name)} paused</span>`);
   renderMyAgents();
@@ -4141,6 +4242,8 @@ function resumeAgent(addr) {
   const ag = _agents.get(addr);
   if (!ag) return;
   ag.paused = false;
+  ag._pauseReason = null;
+  ag._overspendStreak = 0;    // user pressing resume means they've handled whatever caused the pause
   ag.status = "resuming";
   logToUI(`<span class='ok'>▶ ${escapeHTML(ag.name)} resumed</span>`);
   renderMyAgents();
@@ -4170,7 +4273,11 @@ async function stopAgent(addr) {
   if (!ag) return;
   if (!confirm(`Stop ${ag.name} for this session?\n\nThe on-chain identity (agent:${ag.addr16} box) stays registered. You can re-launch any time with the same 25-word or 24-word mnemonic.`)) return;
   ag.paused = true;
-  if (ag.intervalId) clearInterval(ag.intervalId);
+  // Cancel both the rescheduling chain (intervalId now holds a setTimeout id)
+  // and the kickoff first-run timeout. Either could fire a tick that writes
+  // to chain after the user asked us to stop.
+  if (ag.intervalId) clearTimeout(ag.intervalId);
+  if (ag.firstTickTimeoutId) clearTimeout(ag.firstTickTimeoutId);
   logToUI(`<span class='warn'>🛑 ${escapeHTML(ag.name)} stopped for this session. On-chain identity still registered (re-launch any time with the same mnemonic).</span>`);
   _agents.delete(addr);
   renderMyAgents();
@@ -4197,7 +4304,11 @@ async function deleteAgentData(addr) {
   if (!ok2) return;
 
   ag.paused = true;
-  if (ag.intervalId) clearInterval(ag.intervalId);
+  // Cancel both the rescheduling chain (intervalId now holds a setTimeout id)
+  // and the kickoff first-run timeout. Either could fire a tick that writes
+  // to chain after the user asked us to stop.
+  if (ag.intervalId) clearTimeout(ag.intervalId);
+  if (ag.firstTickTimeoutId) clearTimeout(ag.firstTickTimeoutId);
   logToUI(`<span class='warn'>🗑 Deleting on-chain box for ${escapeHTML(ag.name)}…</span>`);
   try {
     await deleteEntity(ag.account, `agent:${ag.addr16}`);
