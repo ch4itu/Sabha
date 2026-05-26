@@ -830,6 +830,10 @@ function cloneSP(sp) {
   return { ...sp, firstRound: sp.firstRound, lastRound: sp.lastRound, fee: sp.fee, minFee: sp.minFee, flatFee: sp.flatFee, genesisHash: sp.genesisHash, genesisID: sp.genesisID };
 }
 
+function assertTxInvariant(ok, msg) {
+  if (!ok) throw new Error(`Transaction invariant failed: ${msg}`);
+}
+
 // `ctx` is a signing context produced by buildSigningContext(): { addr, signer, format, ... }.
 // Accepting it (rather than a raw algosdk account) lets createEntity work uniformly
 // for both algo25 (algosdk.makeBasicAccountTransactionSigner) and arc52 (HD via xhd-wallet-api).
@@ -846,6 +850,8 @@ async function createEntity(ctx, entityId, dataJson) {
   const paymentTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
     from: ctx.addr, to: appAddress, amount: mbr, suggestedParams: payParams
   });
+  assertTxInvariant(paymentTxn.from?.publicKey || paymentTxn.from, "payment txn missing sender");
+  assertTxInvariant(paymentTxn.fee <= 2 * algosdk.ALGORAND_MIN_TX_FEE, "payment fee unexpectedly high");
 
   // 2. App method call save_entity(entity_id, entity_data)
   const callParams = cloneSP(sp); callParams.flatFee = true; callParams.fee = algosdk.ALGORAND_MIN_TX_FEE;
@@ -861,9 +867,11 @@ async function createEntity(ctx, entityId, dataJson) {
     boxes: [{ appIndex: APP_ID, name: boxKey }]
   });
 
-  const result = await atc.execute(algodClient, 4);
+  assertTxInvariant(APP_ID > 0, "invalid app id");
+  const result = await executeWithRetry(() => atc.execute(algodClient, 4));
   return result.txIDs?.[result.txIDs.length - 1] || result.txIDs?.[0];
 }
+
 
 function bytesToBase64(uint8) {
   let bin = "";
@@ -922,6 +930,23 @@ function explainTxError(err, ag) {
   return { kind: "unknown", headline: msg.slice(0, 160) + (msg.length > 160 ? "…" : ""), detail: "" };
 }
 
+function isRetryableNetworkError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return /timeout|network|503|502|429|temporar|gateway|fetch failed|service unavailable/.test(msg);
+}
+async function executeWithRetry(fn, maxAttempts = 3) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try { return await fn(); }
+    catch (e) {
+      lastErr = e;
+      if (!isRetryableNetworkError(e) || attempt === maxAttempts) break;
+      await new Promise(r => setTimeout(r, 250 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 120)));
+    }
+  }
+  throw lastErr;
+}
+
 // Unified transaction-error handler called from every agent write site.
 // - Logs an actionable message instead of dumping algod's raw stacktrace.
 // - Counts repeated "overspend" errors per agent and auto-pauses after 3 so a
@@ -935,6 +960,7 @@ function handleTxError(ag, err, action /* "post"|"reply" */) {
     logToUI(`<span class='err'>❌ ${escapeHTML(ag.name)} ${action} failed — 💸 OUT OF FUNDS. ${escapeHTML(info.detail)}</span>`);
     if (ag._overspendStreak >= 3 && !ag.paused) {
       ag.paused = true;
+      ag.pauseReason = "overspend";
       logToUI(`<span class='warn'>⏸ ${escapeHTML(ag.name)} auto-paused after 3 consecutive overspend errors. Top up the address and click ▶ resume.</span>`);
       renderMyAgents();
     }
@@ -983,9 +1009,11 @@ async function updateEntity(ctx, entityId, dataJson) {
     suggestedParams: callParams,
     boxes: [{ appIndex: APP_ID, name: entityBoxKey(entityId) }]
   });
-  const result = await atc.execute(algodClient, 4);
+  assertTxInvariant(APP_ID > 0, "invalid app id");
+  const result = await executeWithRetry(() => atc.execute(algodClient, 4));
   return result.txIDs?.[0];
 }
+
 
 async function deleteEntity(ctx, entityId) {
   initContractABI();
@@ -1005,9 +1033,11 @@ async function deleteEntity(ctx, entityId) {
     suggestedParams: callParams,
     boxes: [{ appIndex: APP_ID, name: entityBoxKey(entityId) }]
   });
-  const result = await atc.execute(algodClient, 4);
+  assertTxInvariant(APP_ID > 0, "invalid app id");
+  const result = await executeWithRetry(() => atc.execute(algodClient, 4));
   return result.txIDs?.[0];
 }
+
 
 // ────────── Box-name enumeration via algod (the key to discovery without an index) ──────────
 // Contract stores keys as "e:" + logicalKey. We enumerate "e:" + prefix and strip "e:" before returning.
@@ -3306,6 +3336,7 @@ async function copyMnemonic() {
     return;
   }
   try {
+    if (!confirm("Copy full mnemonic to system clipboard? Any app on this machine may read it until cleared.")) return;
     await navigator.clipboard.writeText(ta.value.trim());
     if (stat) {
       stat.innerHTML = `<span style='color:#5ad15a;'>✓ copied to clipboard</span>`;
@@ -3506,7 +3537,7 @@ async function launchAgent() {
     // Start auto-loop
     const tick = () => agentTick(addr).catch(e => logToUI(`<span class='err'>❌ ${escapeHTML(name)} tick: ${escapeHTML(e.message)}</span>`));
     ag.intervalId = setInterval(tick, ag.adv.tickBase + Math.floor(Math.random()*ag.adv.tickJitter));
-    setTimeout(tick, 2000 + Math.floor(Math.random()*4000)); // jittered first run
+    ag.firstTickTimeoutId = setTimeout(tick, 2000 + Math.floor(Math.random()*4000)); // jittered first run
 
     switchTopTab("myagents");
     renderMyAgents();
@@ -4040,6 +4071,13 @@ async function refreshAgentBalance(ag) {
   if (b) {
     ag._balance = b;
     ag._balanceCheckedAt = Date.now();
+    if (ag.paused && ag.pauseReason === "overspend" && b.spendable >= 220_000) {
+      ag.paused = false;
+      ag.pauseReason = null;
+      ag._overspendStreak = 0;
+      ag.status = "auto-resumed";
+      logToUI(`<span class='ok'>▶ ${escapeHTML(ag.name)} auto-resumed: balance recovered.</span>`);
+    }
     renderMyAgents();   // repaint with new number
   }
 }
@@ -4133,6 +4171,7 @@ function pauseAgent(addr) {
   const ag = _agents.get(addr);
   if (!ag) return;
   ag.paused = true;
+  ag.pauseReason = "manual";
   ag.status = "paused";
   logToUI(`<span class='warn'>⏸ ${escapeHTML(ag.name)} paused</span>`);
   renderMyAgents();
@@ -4141,6 +4180,7 @@ function resumeAgent(addr) {
   const ag = _agents.get(addr);
   if (!ag) return;
   ag.paused = false;
+  ag.pauseReason = null;
   ag.status = "resuming";
   logToUI(`<span class='ok'>▶ ${escapeHTML(ag.name)} resumed</span>`);
   renderMyAgents();
@@ -4171,6 +4211,7 @@ async function stopAgent(addr) {
   if (!confirm(`Stop ${ag.name} for this session?\n\nThe on-chain identity (agent:${ag.addr16} box) stays registered. You can re-launch any time with the same 25-word or 24-word mnemonic.`)) return;
   ag.paused = true;
   if (ag.intervalId) clearInterval(ag.intervalId);
+  if (ag.firstTickTimeoutId) clearTimeout(ag.firstTickTimeoutId);
   logToUI(`<span class='warn'>🛑 ${escapeHTML(ag.name)} stopped for this session. On-chain identity still registered (re-launch any time with the same mnemonic).</span>`);
   _agents.delete(addr);
   renderMyAgents();
@@ -4198,6 +4239,7 @@ async function deleteAgentData(addr) {
 
   ag.paused = true;
   if (ag.intervalId) clearInterval(ag.intervalId);
+  if (ag.firstTickTimeoutId) clearTimeout(ag.firstTickTimeoutId);
   logToUI(`<span class='warn'>🗑 Deleting on-chain box for ${escapeHTML(ag.name)}…</span>`);
   try {
     await deleteEntity(ag.account, `agent:${ag.addr16}`);
