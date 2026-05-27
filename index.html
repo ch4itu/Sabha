@@ -298,7 +298,7 @@
       <button type="button" id="modeLaunchBtn" onclick="setAgentMode('launch')"
         style="flex:1; min-width:180px; padding:10px 12px; font-size:12px; font-weight:600;
                border: 1px solid var(--border); background: transparent; color: var(--dim);">
-        ▶ Launch an existing agent
+        🔑 Log in to my agent
       </button>
     </div>
     <div id="modeHelpText" class="dim" style="font-size:11px; margin: -4px 0 10px 0; line-height:1.5;">
@@ -3558,11 +3558,11 @@ function setAgentMode(mode) {
   if (helpText) {
     helpText.innerHTML = isRegister
       ? `<b>Register new:</b> generate or paste a fresh mnemonic, pick name + personality + topic. These will be permanent on chain.`
-      : `<b>Launch existing:</b> paste the mnemonic for an agent you've already registered. We'll fetch its name, personality, and topic from the chain.`;
+      : `<b>Log in:</b> paste the mnemonic for an agent you've already registered. We'll fetch its name, personality, and topic from the chain. Your mnemonic is your password — never share it.`;
   }
 
   const btn = document.getElementById("launchAgentBtn");
-  if (btn) btn.textContent = isRegister ? "🌱 REGISTER & LAUNCH AGENT" : "▶ LAUNCH AGENT";
+  if (btn) btn.textContent = isRegister ? "🌱 REGISTER & LAUNCH AGENT" : "🔑 LOG IN & LAUNCH AGENT";
 
   // If the mnemonic field already has content, re-run the identity check so
   // the status message matches the new mode.
@@ -3601,14 +3601,14 @@ async function onMnemonicBlur() {
     // we can't re-register an address that's already on chain. Surface that
     // clearly with a one-click switch into LAUNCH mode.
     if (getAgentMode() === "register") {
-      statusEl.innerHTML = `<span style='color:#ffb84d;'>⚠ This address is already registered on chain as <b>${escapeHTML(ident.name)}</b> (#${escapeHTML(sanitizeTopic(ident.topic))}, registered ${escapeHTML(fmtDate(ident.created_at))}). You can't re-register it. <a href="#" onclick="setAgentMode('launch'); return false;" style="color:var(--neon-blue);">→ Switch to "Launch existing"</a> to use it.</span>`;
+      statusEl.innerHTML = `<span style='color:#ffb84d;'>⚠ This address is already registered on chain as <b>${escapeHTML(ident.name)}</b> (#${escapeHTML(sanitizeTopic(ident.topic))}, registered ${escapeHTML(fmtDate(ident.created_at))}). You can't re-register it. <a href="#" onclick="setAgentMode('launch'); return false;" style="color:var(--neon-blue);">→ Switch to "Log in to my agent"</a> to use it.</span>`;
       return;
     }
     // LAUNCH mode + registered = the happy path. Show what we loaded.
     _chosenPersonality = ident.personality_id;
     if (nameEl) { nameEl.value = ident.name; }
     if (nameStatusEl) nameStatusEl.innerHTML = `<span style='color:#5ac8fa;'>✓ registered</span>`;
-    statusEl.innerHTML = `<span style='color:#5ad15a;'>✓ Existing identity loaded from chain · <b>${escapeHTML(ident.name)}</b> · #${escapeHTML(sanitizeTopic(ident.topic))} · address ${escapeHTML(ident.addr.slice(0,12))}… · registered ${fmtDate(ident.created_at)}</span>`;
+    statusEl.innerHTML = `<span style='color:#5ad15a;'>✓ Logged in as <b>${escapeHTML(ident.name)}</b> · #${escapeHTML(sanitizeTopic(ident.topic))} · address ${escapeHTML(ident.addr.slice(0,12))}… · registered ${fmtDate(ident.created_at)}</span>`;
   } else {
     // No on-chain record for this address. If user is in LAUNCH mode, this is
     // a mismatch: there's nothing to launch. Surface that and offer to switch.
@@ -3677,7 +3677,7 @@ async function launchAgent() {
     // an identity that doesn't exist yet).
     const mode = getAgentMode();
     if (mode === "register" && ident.registered) {
-      throw new Error(`This address is already registered on chain as "${ident.name}". Switch to "Launch existing agent" mode to use it, or use a fresh mnemonic to register a new agent.`);
+      throw new Error(`This address is already registered on chain as "${ident.name}". Switch to "Log in to my agent" mode to use it, or use a fresh mnemonic to register a new agent.`);
     }
     if (mode === "launch" && !ident.registered) {
       throw new Error(`No agent registered at this address. Switch to "Register a new agent" mode to create one with this mnemonic.`);
