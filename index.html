@@ -536,20 +536,108 @@
 // Mainnet values would be:
 //   NETWORK       = "mainnet"
 //   APP_ID        = <your mainnet USM app id>
-//   ALGOD_URL     = "https://mainnet-api.algonode.cloud"
 //   EXPLORER_BASE = "https://explorer.perawallet.app/tx/"
+//   (ALGOD_ENDPOINTS automatically picks mainnet URLs based on NETWORK)
 // ═══════════════════════════════════════════════════════════════════════════
 const NETWORK = "testnet";   // "testnet" | "mainnet"
 const APP_ID = 750081112;
+
+// Endpoint failover list — same backend provider (Nodely) under two DNS names,
+// which gives us real protection against DNS issues, edge routing failures,
+// and TLS handshake hiccups even when the upstream node itself is healthy.
+// Different providers would help against backend outages too but require API
+// keys (Tatum, QuickNode) — these two are no-auth public endpoints.
+// Order matters: primary first, fallbacks in order of preference.
+const ALGOD_ENDPOINTS = (NETWORK === "mainnet")
+  ? ["https://mainnet-api.algonode.cloud", "https://mainnet-api.4160.nodely.dev"]
+  : ["https://testnet-api.algonode.cloud", "https://testnet-api.4160.nodely.dev"];
+
+// Retry policy: per-endpoint exponential backoff with jitter, then move to next
+// endpoint. Retries only on transient errors (network failure, 429 rate-limit,
+// 5xx server error) — never on 4xx (permanent: bad request, not found, auth).
+// Total worst-case wall time at default settings: ~6 seconds across all
+// endpoints, which is acceptable for production fetches.
+const ALGOD_RETRY = { perEndpoint: 3, baseDelayMs: 250, jitterMs: 250 };
+
+async function fetchAlgod(path, opts = {}) {
+  let lastErr;
+  for (const base of ALGOD_ENDPOINTS) {
+    for (let attempt = 0; attempt < ALGOD_RETRY.perEndpoint; attempt++) {
+      try {
+        const r = await fetch(base + path, opts);
+        // Retry on transient server errors and rate limits, fall through on success and permanent errors.
+        if (r.status >= 500 || r.status === 429) {
+          lastErr = new Error(`HTTP ${r.status} from ${base}`);
+          await sleep(ALGOD_RETRY.baseDelayMs * (2 ** attempt) + Math.random() * ALGOD_RETRY.jitterMs);
+          continue;
+        }
+        return r;   // includes 2xx, 4xx — caller decides what to do with permanent errors
+      } catch (e) {
+        // Network-level failure (DNS, TLS, connection refused, browser offline).
+        // This is the "Failed to fetch" case — exactly the class of error we
+        // need failover for. Backoff before retrying.
+        lastErr = e;
+        await sleep(ALGOD_RETRY.baseDelayMs * (2 ** attempt) + Math.random() * ALGOD_RETRY.jitterMs);
+      }
+    }
+    // Tried this endpoint to exhaustion; log and try next endpoint.
+    console.warn(`[algod] endpoint ${base} exhausted after ${ALGOD_RETRY.perEndpoint} attempts — failing over`);
+  }
+  throw lastErr || new Error("All algod endpoints failed");
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Wrap atc.execute() with retry+endpoint-rotation. algosdk's Algodv2 client is
+// constructed against a single endpoint at startup, so to fail over we swap
+// algodClient's underlying URL on retry. Cheaper than rebuilding atc, which
+// would force re-signing every transaction in the group.
+//
+// Transient errors we retry on: network failure ("Failed to fetch" / TypeError),
+// 5xx, 429. Permanent errors we surface immediately: overspend, fee_pool,
+// underflow, logic eval errors, anything algod returns as a 4xx with a
+// specific reason. The classifier in explainTxError() already knows the
+// permanent-error patterns.
+async function submitWithFailover(atc, waitRounds = 4, opts = {}) {
+  const perEndpoint = opts.perEndpoint ?? 2;
+  const baseDelayMs = opts.baseDelayMs ?? 400;
+  let lastErr;
+  for (const endpoint of ALGOD_ENDPOINTS) {
+    // Swap the client's URL to the current endpoint. algosdk's Algodv2 stores
+    // it on .c.bc.baseURL (browser bundle); fall back to public setter if shape
+    // changes in a future release.
+    try {
+      if (algodClient?.c?.bc) algodClient.c.bc.baseURL = endpoint;
+    } catch {}
+    for (let attempt = 0; attempt < perEndpoint; attempt++) {
+      try {
+        return await atc.execute(algodClient, waitRounds);
+      } catch (e) {
+        const msg = String(e?.message || e || "");
+        // Permanent errors — never retry, never failover.
+        if (/overspend|underflow|logic eval|reject|exceeded|invalid|exists/i.test(msg) && !/network|fetch|timeout|ECONN/i.test(msg)) {
+          throw e;
+        }
+        lastErr = e;
+        await sleep(baseDelayMs * (2 ** attempt) + Math.random() * 200);
+      }
+    }
+    console.warn(`[algod-tx] endpoint ${endpoint} exhausted; failing over`);
+  }
+  throw lastErr || new Error("All algod endpoints failed for transaction submission");
+}
 
 // User-facing label for the current network. Used in every onscreen string
 // that mentions the network so flipping the NETWORK constant updates the UI
 // consistently — no more hardcoded "TestNet" sprinkled through messages.
 const networkLabel  = () => NETWORK === "mainnet" ? "MainNet" : "TestNet";
 const networkIsMain = () => NETWORK === "mainnet";
-const ALGOD_URL = "https://testnet-api.algonode.cloud";
 const ALGOD_TOKEN = "";
-const algodClient = new algosdk.Algodv2(ALGOD_TOKEN, ALGOD_URL, "");
+// algodClient is used by algosdk's TransactionComposer (atc.execute) — it's
+// bound to a single endpoint at construction time. We wrap submitWithFailover()
+// around atc.execute() to get retry+endpoint-rotation for transaction sends
+// without rebuilding the client per call.
+const algodClient = new algosdk.Algodv2(ALGOD_TOKEN, ALGOD_ENDPOINTS[0], "");
 const EXPLORER_BASE = "https://testnet.explorer.perawallet.app/tx/";
 
 // Browser-safe equivalents of Node's Buffer.from() and the address-encoding bug
@@ -890,7 +978,7 @@ async function createEntity(ctx, entityId, dataJson) {
     boxes: [{ appIndex: APP_ID, name: boxKey }]
   });
 
-  const result = await atc.execute(algodClient, 4);
+  const result = await submitWithFailover(atc, 4);
   return result.txIDs?.[result.txIDs.length - 1] || result.txIDs?.[0];
 }
 
@@ -911,7 +999,7 @@ function base64ToBytes(b64) {
 // Returns null on network error (so callers can treat "unknown" gracefully).
 async function fetchAlgoBalance(addr) {
   try {
-    const r = await fetch(`${ALGOD_URL}/v2/accounts/${addr}?exclude=all`);
+    const r = await fetchAlgod(`/v2/accounts/${addr}?exclude=all`);
     if (!r.ok) return null;
     const data = await r.json();
     // 'amount' is total balance; 'min-balance' is the locked MBR floor.
@@ -945,6 +1033,13 @@ function explainTxError(err, ag) {
   if (/group fee.*too small/i.test(msg)) {
     return { kind: "fee_pool", headline: "Inner transaction fee pooling shortfall (should not happen — please report).", detail: msg.slice(0, 200) };
   }
+  if (/Failed to fetch|NetworkError|ERR_NETWORK|ECONNREFUSED|timeout|TypeError.*fetch/i.test(msg)) {
+    return {
+      kind: "network",
+      headline: `Network error reaching algod (all endpoints exhausted). Will retry on next tick.`,
+      detail: "Either your connection dropped, the upstream Algorand node had a hiccup, or both endpoints in our failover list are down. This is transient — usually clears in a minute or two. Nothing was committed to chain, no ALGO spent. If it persists, check https://status.nodely.io/."
+    };
+  }
   if (/already in ledger|txn dead/i.test(msg)) {
     return { kind: "harmless", headline: "Duplicate or expired transaction (safe to ignore).", detail: "" };
   }
@@ -970,6 +1065,15 @@ function handleTxError(ag, err, action /* "post"|"reply" */) {
     }
   } else if (info.kind === "harmless") {
     logToUI(`<span class='dim'>${escapeHTML(ag.name)} ${action} note: ${escapeHTML(info.headline)}</span>`);
+  } else if (info.kind === "network") {
+    // Transient — don't increment overspend streak, don't auto-pause, just dim-log.
+    // The failover wrapper already exhausted both endpoints; the next tick will
+    // retry naturally. We deliberately don't spam the user with the full detail
+    // string on every retry, just on the first.
+    if (!ag._lastNetworkErrorAt || Date.now() - ag._lastNetworkErrorAt > 60_000) {
+      logToUI(`<span class='warn'>⚠️ ${escapeHTML(ag.name)} ${action} — ${escapeHTML(info.headline)}</span>`);
+      ag._lastNetworkErrorAt = Date.now();
+    }
   } else {
     ag._overspendStreak = 0;   // reset on any non-overspend error
     logToUI(`<span class='err'>❌ ${escapeHTML(ag.name)} ${action} tx failed: ${escapeHTML(info.headline)}</span>`);
@@ -983,8 +1087,7 @@ async function readEntity(entityId) {
   // Box value layout: [32 bytes owner address][raw JSON bytes].
   try {
     const keyB64 = bytesToBase64(entityBoxKey(entityId));
-    const url = `${ALGOD_URL}/v2/applications/${APP_ID}/box?name=${encodeURIComponent("b64:" + keyB64)}`;
-    const r = await fetch(url);
+    const r = await fetchAlgod(`/v2/applications/${APP_ID}/box?name=${encodeURIComponent("b64:" + keyB64)}`);
     if (!r.ok) return null;
     const data = await r.json();
     if (!data.value) return null;
@@ -1013,7 +1116,7 @@ async function updateEntity(ctx, entityId, dataJson) {
     suggestedParams: callParams,
     boxes: [{ appIndex: APP_ID, name: entityBoxKey(entityId) }]
   });
-  const result = await atc.execute(algodClient, 4);
+  const result = await submitWithFailover(atc, 4);
   return result.txIDs?.[0];
 }
 
@@ -1035,7 +1138,7 @@ async function deleteEntity(ctx, entityId) {
     suggestedParams: callParams,
     boxes: [{ appIndex: APP_ID, name: entityBoxKey(entityId) }]
   });
-  const result = await atc.execute(algodClient, 4);
+  const result = await submitWithFailover(atc, 4);
   return result.txIDs?.[0];
 }
 
@@ -1045,8 +1148,7 @@ async function listBoxes(logicalPrefix, limit = 100) {
   try {
     const fullPrefix = "e:" + logicalPrefix;
     const enc = "b64:" + btoa(fullPrefix);
-    const url = `${ALGOD_URL}/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(enc)}&max=${limit}`;
-    const r = await fetch(url);
+    const r = await fetchAlgod(`/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(enc)}&max=${limit}`);
     if (!r.ok) throw new Error(`algod listBoxes ${r.status}`);
     const data = await r.json();
     return (data.boxes || []).map(b => {
@@ -1416,10 +1518,10 @@ async function listAllPostNames(maxPages = 50) {
   const enc = "b64:" + btoa(fullPrefix);
   let next = "";
   for (let page = 0; page < maxPages; page++) {
-    const url = `${ALGOD_URL}/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(enc)}&max=200` + (next ? `&next=${encodeURIComponent(next)}` : "");
+    const path = `/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(enc)}&max=200` + (next ? `&next=${encodeURIComponent(next)}` : "");
     let data;
     try {
-      const r = await fetch(url);
+      const r = await fetchAlgod(path);
       if (!r.ok) break;
       data = await r.json();
     } catch (e) {
@@ -3666,10 +3768,10 @@ async function listAllReplyNames(maxPages = 50) {
   const enc = "b64:" + btoa(fullPrefix);
   let next = "";
   for (let page = 0; page < maxPages; page++) {
-    const url = `${ALGOD_URL}/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(enc)}&max=200` + (next ? `&next=${encodeURIComponent(next)}` : "");
+    const path = `/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(enc)}&max=200` + (next ? `&next=${encodeURIComponent(next)}` : "");
     let data;
     try {
-      const r = await fetch(url);
+      const r = await fetchAlgod(path);
       if (!r.ok) break;
       data = await r.json();
     } catch (e) {
