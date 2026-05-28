@@ -351,6 +351,9 @@
       <div class="dim" style="font-size:10px; margin-top:6px;">
         Needs Chrome + WebGPU. Model cached in browser after first download; subsequent loads are instant.
       </div>
+      <div style="font-size:10px; margin-top:6px; padding:7px 9px; background:#1a1410; border:1px solid #5a3a1a; border-radius:4px; color:#d4a574; line-height:1.5;">
+        ⚠ <b style="color:#ffb84d;">Keep this tab in the foreground with the screen on.</b> Local models run in your phone's GPU. If you switch apps, lock the screen, or let it sleep, the browser unloads the model and local agents pause until you reload it. For unattended or background running, use a <b>cloud provider</b> instead — it has no GPU context to lose.
+      </div>
 
       <details style="margin-top:8px; border:1px dashed var(--border); border-radius:4px; padding:6px 10px;">
         <summary style="cursor:pointer; user-select:none; font-size:12px; color:var(--neon-blue);">
@@ -2825,6 +2828,20 @@ function cleanLLMOutput(text, persName) {
   else if (t.startsWith("*") && t.endsWith("*") && t.length > 2) t = t.slice(1, -1).trim();
   if (t.startsWith("__") && t.endsWith("__") && t.length > 4) t = t.slice(2, -2).trim();
 
+  // Reasoning-model leakage (Qwen3, DeepSeek-R1, etc.). These "thinking" models
+  // emit their chain-of-thought before the answer. Under a tight char budget
+  // the post becomes pure reasoning, e.g. "Okay, the user wants me to start a
+  // new thread as a philosopher…". Strip it; never appears in a real post.
+  // 1) Closed <think>...</think> — keep only what follows.
+  t = t.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  // 2) Unclosed <think> (truncated mid-thought) — drop from the tag onward.
+  const openThink = t.search(/<think>/i);
+  if (openThink !== -1) t = t.slice(0, openThink).trim();
+  // 3) Bare reasoning preamble: "Okay, the user wants me to …" / "So I need to …".
+  t = t.replace(/^(okay|alright|ok|so|right|well|hmm|let me think)[\s,!.\-]+(the user|i|i'?m|let me|let's|first|now|they|we|my task)\b[^.!?]*[.!?]?\s*/i, "").trim();
+  // 4) "The user wants/asked me to …" without the filler opener.
+  t = t.replace(/^(the user|they)\s+(wants?|asked|expects?|want me|wants me)\b[^.!?]*[.!?]?\s*/i, "").trim();
+
   // Verbose preambles — only strip if substantive content remains afterwards.
   const prefixPatterns = [
     /^(sure|certainly|of course|absolutely|got it|okay|ok|alright)[!,.:\s]+/i,
@@ -2902,10 +2919,19 @@ async function callLLM(provider, apiKey, systemPrompt, userPrompt, extra) {
     // Capture the engine reference at call-start. If the user re-initializes mid-call,
     // window.webllmEngine swaps under us — but our local ref is still the old (now-disposed) one.
     const engine = window.webllmEngine;
+    // Qwen3 models emit chain-of-thought ("<think>…") by default. Under a tight
+    // char budget that produces pure reasoning ("Okay, the user wants me to…")
+    // instead of an actual post. Qwen3 honours a "/no_think" soft switch in the
+    // prompt to turn thinking off — append it only for Qwen3 so other models
+    // aren't given stray text to echo.
+    let sysContent = systemPrompt;
+    if (/qwen3/i.test(window.webllmCurrentModel || "")) {
+      sysContent = `${systemPrompt}\n/no_think`;
+    }
     try {
       const r = await engine.chat.completions.create({
         messages: [
-          { role: "system", content: systemPrompt },
+          { role: "system", content: sysContent },
           { role: "user",   content: userPrompt }
         ],
         max_tokens: (extra?.maxTokens ?? 60),
@@ -4971,6 +4997,19 @@ async function initWebLLMCustom() {
     logToUI(`<span class='err'>❌ Custom WebLLM init failed: ${escapeHTML(e.message || String(e))}</span>`);
   }
 }
+
+// ── Local (WebLLM) backgrounding notice ─────────────────────────────────────
+// Local models live in the GPU via WebGPU. Mobile browsers discard the WebGPU
+// context when the tab backgrounds or the screen sleeps, which disposes the
+// loaded model mid-run (the "engine was disposed" error). We don't act on the
+// user's device to prevent this (no forced wake-lock) — we just inform them the
+// moment the tab is hidden while a local model is loaded, so the later disposal
+// error isn't a mystery. Cloud agents are immune (no local GPU context to lose).
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" && window.webllmReady) {
+    logToUI(`<span class='warn'>⚠️ Tab backgrounded — the browser may unload local (WebLLM) models now. Keep Sabha in the foreground with the screen on, or switch agents to a cloud provider for unattended running.</span>`);
+  }
+});
 
 async function initWebLLMHandler() {
   const btn = document.getElementById("btnInitBrain");
