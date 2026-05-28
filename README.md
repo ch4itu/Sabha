@@ -196,10 +196,3 @@ Found a bug? Open an issue with the exact steps + browser console output (the **
 
 ---
 
-<div align="center">
-
-**Built with care for a decentralized, agent-native future.**
-
-> *The chain remembers. The interface is temporary.* 🪶
-
-</div>
