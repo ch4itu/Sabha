@@ -977,10 +977,10 @@ const _faceSpecCache = new Map();
 function _faceExtractJSON(t){ t=(t||"").replace(/```json|```/g,"").trim(); const a=t.indexOf("{"),b=t.lastIndexOf("}"); if(a>=0&&b>a) t=t.slice(a,b+1); return JSON.parse(t); }
 async function prefetchFaceSpecs(){
   try{
-    const keys=await listBoxes("face:",300);
+    const keys=await listBoxes("f:",300);   // box name = "e:"+"f:"+addr = 62 bytes (≤64 limit)
     let added=0;
     await Promise.all(keys.map(k=>{
-      const addr=k.slice(5);
+      const addr=k.slice(2);
       if(_faceSpecCache.has(addr)) return;            // permanent — fetch each face once
       return readEntity(k).then(raw=>{
         if(!raw) return; try{ _faceSpecCache.set(addr, _faceClampSpec(JSON.parse(raw))); _faceSpecSvgCache.delete(addr); added++; }catch{}
@@ -998,14 +998,14 @@ async function ensureAgentFace(ag){
   try{
     if(!ag||!ag.addr) return;
     if(_faceSpecCache.has(ag.addr)) return;                       // known this session
-    const existing = await readEntity("face:"+ag.addr).catch(()=>null);
+    const existing = await readEntity("f:"+ag.addr).catch(()=>null);
     if(existing){ try{ _faceSpecCache.set(ag.addr,_faceClampSpec(JSON.parse(existing))); _faceSpecSvgCache.delete(ag.addr); if(typeof renderFeed==="function") renderFeed(); }catch{} return; }
     let text;
     try{ text = await callLLM(ag.provider, ag.apiKey, "", FACE_DESIGN_PROMPT, { baseUrl:ag.customBaseUrl, model:ag.customModel, maxTokens:220, temperature:0.95 }); }
     catch(e){ logToUI(`<span class='dim'>  ${escapeHTML(ag.name)} face: model busy — keeping fallback face for now</span>`); return; }
     let spec; try{ spec=_faceClampSpec(_faceExtractJSON(text)); }catch{ logToUI(`<span class='dim'>  ${escapeHTML(ag.name)} face: design unparseable — keeping fallback</span>`); return; }
     if(!_agents.has(ag.addr)) return;
-    const txId = await createEntity(ag.account, "face:"+ag.addr, JSON.stringify(spec));
+    const txId = await createEntity(ag.account, "f:"+ag.addr, JSON.stringify(spec));
     _faceSpecCache.set(ag.addr, spec); _faceSpecSvgCache.delete(ag.addr);
     refreshAgentBalance(ag).catch(()=>{});
     logToUI(`<span class='ok'>🪪 ${escapeHTML(ag.name)} designed its own face on-chain. <a href='${EXPLORER_BASE}${encodeURIComponent(txId||'')}' target='_blank' style='color:var(--neon-blue)'>tx ↗</a></span>`);
@@ -1305,34 +1305,66 @@ async function agentChooseCanvasTheme(ag){
   }catch{ return fb(); }
 }
 
-// Agent action — paint ONE pixel, chosen by the agent's own LLM
+// Snap a desired (x,y) to the nearest EMPTY cell (Manhattan). Returns null if full.
+// Lets us honour the agent's spatial intent while guaranteeing the stroke lands —
+// and makes any duplicate/echoed picks fan out instead of colliding on one square.
+function nearestEmptyCell(grid, x, y){
+  const W = grid.w, H = grid.h;
+  x = Math.max(0, Math.min(W-1, x|0)); y = Math.max(0, Math.min(H-1, y|0));
+  if (grid.grid[y*W+x] === null) return [x, y];
+  let best = null, bd = Infinity;
+  for (let i=0;i<grid.grid.length;i++){
+    if (grid.grid[i] !== null) continue;
+    const cx = i%W, cy = (i/W)|0, d = Math.abs(cx-x) + Math.abs(cy-y);
+    if (d < bd){ bd = d; best = [cx, cy]; }
+  }
+  return best;
+}
+
+// Agent action — the agent's own LLM chooses WHERE and WHICH COLOUR, at its
+// discretion. Collaboratively, the agents compose the image. The only safety net:
+// if the chosen cell is off-grid or already taken we snap to the nearest free one
+// (preserving intent), and if no colour is given we pick a varied default — so a
+// stroke always lands and the piece never collapses onto one square/one colour.
 async function paintOnCanvas(ag, canvas, paints, grid){
   grid = grid || buildCanvasGrid(canvas, paints || await loadCanvasPaints(canvas.id));
   if (grid.full) return;
-  const legend = CANVAS_PALETTE.map((c,i)=>`${i}=${CANVAS_COLOR_NAMES[i]}`).join(", ");
-  const userPrompt = `AI agents are together painting a symmetric MANDALA. You paint ONE cell of a ${grid.w}x${grid.h} quarter; it is mirrored 4 ways into the full design, so whatever you fill becomes part of a symmetric pattern. Mood: "${canvas.theme}".
-Current quarter (a dot "." is EMPTY and paintable; any digit/letter is a LOCKED colour):
+  const W = grid.w, H = grid.h;
+  const legend = CANVAS_PALETTE.map((col,i)=>`${i}=${CANVAS_COLOR_NAMES[i]}`).join(", ");
+  const userPrompt = `AI agents are painting a symmetric MANDALA together — each agent decides WHERE and WHICH COLOUR, at its own discretion. You add ONE cell to an ${W}x${H} quarter; it is mirrored 4 ways into the full image, so your choice shapes a symmetric pattern. Mood: "${canvas.theme}".
+
+Current quarter (each character is one cell — "." = EMPTY/paintable, any other character = already painted and LOCKED):
 ${canvasGridToText(grid)}
+x = column, counted 0..${W-1} from the LEFT.  y = row, counted 0..${H-1} from the TOP.
 Palette (index = colour): ${legend}.
-Choose ONE empty cell and a colour that builds a beautiful pattern toward the mood — colours placed next to related colours look harmonious.
-Reply with EXACTLY three numbers: x,y,colour   (x = column 0..${grid.w-1}, y = row 0..${grid.h-1}, colour = palette index 0..${CANVAS_PALETTE.length-1}).
-Output ONLY those three numbers. Example: 4,3,2`;
+
+Pick an EMPTY "." cell and a colour that builds a beautiful pattern toward the mood. Reply with ONLY three comma-separated numbers in the order: x,y,colour`;
   let text;
   try {
-    text = await callLLM(ag.provider, ag.apiKey, "You paint collaborative pixel art one pixel at a time. Answer with only: x,y,colour", userPrompt,
-      { baseUrl: ag.customBaseUrl, model: ag.customModel, maxTokens: 32, temperature: ag.adv.temperature, charLimit: 16 });
+    text = await callLLM(ag.provider, ag.apiKey, "You collaboratively paint pixel-art mandalas, choosing where and what colour. Reply with only three numbers: x,y,colour", userPrompt,
+      { baseUrl: ag.customBaseUrl, model: ag.customModel, maxTokens: 24, temperature: ag.adv.temperature, charLimit: 16 });
   } catch (e) { logToUI(`<span class='err'>❌ ${escapeHTML(ag.name)} canvas LLM error: ${escapeHTML(e.message)}</span>`); return; }
-  const m = (text||"").match(/(-?\d+)\s*[,; ]\s*(-?\d+)\s*[,; ]\s*(\d+)/);
-  if (!m){ logToUI(`<span class='dim'>  🎨 ${escapeHTML(ag.name)} gave no valid pixel ("${escapeHTML((text||"").slice(0,24))}") — skipping</span>`); return; }
-  const x=+m[1], y=+m[2], c=+m[3];
-  if (x<0||x>=grid.w||y<0||y>=grid.h||c<0||c>=CANVAS_PALETTE.length){ logToUI(`<span class='dim'>  🎨 ${escapeHTML(ag.name)} out-of-range (${x},${y},${c}) — skipping</span>`); return; }
-  if (grid.grid[y*grid.w+x] !== null){ logToUI(`<span class='dim'>  🎨 ${escapeHTML(ag.name)} picked a locked cell (${x},${y}) — skipping</span>`); return; }
+  const m = String(text||"").match(/(-?\d+)\D+(-?\d+)(?:\D+(\d+))?/);
+  if (!m){ logToUI(`<span class='dim'>  🎨 ${escapeHTML(ag.name)} gave no usable cell ("${escapeHTML(String(text||"").slice(0,24))}") — skipping this turn</span>`); return; }
+  let x = +m[1], y = +m[2];
+  let c = (m[3] !== undefined) ? +m[3] : -1;
+  // Honour the model's cell; snap only if off-grid or already painted.
+  const cell = nearestEmptyCell(grid, x, y);
+  if (!cell) return;                                          // quarter full
+  const snapped = (cell[0] !== Math.max(0,Math.min(W-1,x|0)) || cell[1] !== Math.max(0,Math.min(H-1,y|0)));
+  x = cell[0]; y = cell[1];
+  // Honour the model's colour; only if it gave none/garbage do we vary by agent+cell.
+  if (c < 0 || c >= CANVAS_PALETTE.length){
+    const seed = (ag.addr||"") + ":" + x + "," + y;
+    let h = 0; for (let k=0;k<seed.length;k++) h = (h*31 + seed.charCodeAt(k)) >>> 0;
+    c = 2 + (h % (CANVAS_PALETTE.length - 2));                // skip 0/1 (bg/white)
+  }
   if (!_agents.has(ag.addr) || ag.paused) return;
   const pv = { canvas: canvas.id, x, y, c, author: ag.addr, agent_name: ag.name, ts: Date.now() };
   try {
     await createEntity(ag.account, `paint:${canvas.id}:${shortId()}`, JSON.stringify(pv));
     refreshAgentBalance(ag).catch(()=>{});
-    logToUI(`<span class='ok'>🎨 ${escapeHTML(ag.name)} painted (${x},${y}) ${CANVAS_COLOR_NAMES[c]} on "${escapeHTML(canvas.theme)}" <a href="#" onclick="openThread(${jsStr(canvas.id)}); return false" style='color:var(--neon-blue)'>watch ↗</a></span>`);
+    logToUI(`<span class='ok'>🎨 ${escapeHTML(ag.name)} painted (${x},${y}) ${CANVAS_COLOR_NAMES[c]} on "${escapeHTML(canvas.theme)}"${snapped?" <span class='dim'>(nearest free cell)</span>":""} <a href="#" onclick="openThread(${jsStr(canvas.id)}); return false" style='color:var(--neon-blue)'>watch ↗</a></span>`);
     try { _canvasGridCache.set(canvas.id, buildCanvasGrid(canvas, await loadCanvasPaints(canvas.id))); updateCanvasCardInFeed(canvas); } catch {}
     logAgentActivity(ag, "paint", `(${x},${y}) ${CANVAS_COLOR_NAMES[c]} on "${canvas.theme}"`, canvas.id);
   } catch (e) { handleTxError(ag, e, "paint"); }
