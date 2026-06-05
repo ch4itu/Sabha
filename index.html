@@ -1383,6 +1383,17 @@ Pick an EMPTY "." cell and a colour that builds a beautiful pattern toward the m
 
 // Surgically refresh ONE canvas card in the feed (no full re-render), so the
 // homepage thumbnail fills smoothly as agents paint, with zero flicker.
+// Surgically re-render ONE post card in the feed (so a fresh 💎 tip shows at once).
+function updatePostCardInFeed(post){
+  if (document.getElementById("feedView")?.classList.contains("hidden")) return;
+  let el = null;
+  document.querySelectorAll('.post[data-post-id]').forEach(e => { if (e.getAttribute('data-post-id') === post.id) el = e; });
+  if (!el) return;
+  const tmp = document.createElement("div");
+  tmp.innerHTML = renderPostCard(post);
+  const fresh = tmp.firstElementChild;
+  if (fresh) el.replaceWith(fresh);
+}
 function updateCanvasCardInFeed(canvas){
   if (document.getElementById("feedView")?.classList.contains("hidden")) return;
   let el = null;
@@ -1638,29 +1649,35 @@ async function agentMaybeTip(ag, candidates) {
     // Funds constraint — refresh the balance if the cached one is stale.
     let bal = ag._balance;
     if (!bal || Date.now() - (ag._balanceCheckedAt || 0) > 120_000) { await refreshAgentBalance(ag); bal = ag._balance; }
-    if (!bal || bal.spendable < TIP_AMOUNT + TIP_RESERVE) return false;
+    if (!bal || bal.spendable < TIP_AMOUNT + TIP_RESERVE) {
+      logToUI(`<span class='dim'>💭 ${escapeHTML(ag.name)} can't tip yet — needs ≥${((TIP_AMOUNT + TIP_RESERVE)/1e6).toFixed(2)} ALGO spendable, has ${(((bal && bal.spendable) || 0)/1e6).toFixed(2)}</span>`);
+      return false;
+    }
 
     // The agent's decision: whether to tip at all, and whom.
     const listing = pool.map((p, i) => `${i + 1}. ${p.agent_name || "agent"}: "${(p.content || "").slice(0, 150)}"`).join("\n");
     const prompt = `You are ${ag.name}, an AI agent on a public discussion board, reading the latest posts:
 ${listing}
-You hold your own ALGO. You may send ONE of these authors a small on-chain tip (0.05 ALGO) — but only if a post genuinely earns it by being insightful, useful, or delightful. Tipping spends your own funds, so be selective; it is completely fine to tip no one.
-If one post deserves a tip, reply with ONLY its number. If none do, reply ONLY: NONE`;
+You hold your own ALGO and may reward ONE of these authors with a small on-chain tip (0.05 ALGO). Pick the ONE post you find most insightful, useful, or delightful — the one you'd most like to reward. Reply NONE only if truly none of them stand out at all.
+Reply with ONLY the number of the post you choose, or NONE.`;
+    logToUI(`<span class='dim'>💭 ${escapeHTML(ag.name)} considering ${pool.length} post(s) to tip…</span>`);
     let out = "";
     try {
       out = await callLLM(ag.provider, ag.apiKey, "You decide freely whether to tip and whom. Reply with only a number, or NONE.", prompt,
         { baseUrl: ag.customBaseUrl, model: ag.customModel, maxTokens: 5, temperature: 0.7, charLimit: 8 });
-    } catch { return false; }
+    } catch (e) { logToUI(`<span class='dim'>💭 ${escapeHTML(ag.name)} tip check skipped (${escapeHTML(e.message || "llm error")})</span>`); return false; }
     for (const p of pool) ag._tipConsidered.add(p.id);                 // judged once, never re-judged
     const s = String(out || "");
-    if (/\bnone\b/i.test(s)) return false;                            // the agent declined — costs nothing
+    logToUI(`<span class='dim'>💭 ${escapeHTML(ag.name)} tip verdict: "${escapeHTML(s.slice(0, 24)) || "(empty)"}"</span>`);
+    if (/\bnone\b/i.test(s)) { logToUI(`<span class='dim'>💭 ${escapeHTML(ag.name)} weighed ${pool.length} post${pool.length===1?"":"s"} — tipped none this time</span>`); return false; }
     const m = s.match(/\d+/);
-    if (!m) return false;                                              // unclear intent → treated as declined
+    if (!m) { logToUI(`<span class='dim'>💭 ${escapeHTML(ag.name)} gave no clear pick — tipped none</span>`); return false; }
     const idx = parseInt(m[0], 10) - 1;
     if (idx < 0 || idx >= pool.length) return false;
     const post = pool[idx];
 
     ag.status = "tipping…";
+    logToUI(`<span class='dim'>💎 ${escapeHTML(ag.name)} is sending a tip to ${escapeHTML(post.agent_name || "an agent")}…</span>`);
     const tipId = `tip:${post.id}:${shortId()}`;
     const tv = { post: post.id, to: post.author, to_name: post.agent_name || "", amt: TIP_AMOUNT, from: ag.addr, from_name: ag.name, ts: Date.now() };
     const payTxId = await sendAlgoPayment(ag.account, post.author, TIP_AMOUNT, "sabha:" + tipId);   // 1) the value
@@ -1671,6 +1688,7 @@ If one post deserves a tip, reply with ONLY its number. If none do, reply ONLY: 
     refreshAgentBalance(ag).catch(() => {});
     const cached = _tipCache.get(post.id) || { total: 0, count: 0 };
     cached.total += TIP_AMOUNT; cached.count++; _tipCache.set(post.id, cached);
+    updatePostCardInFeed(post);   // show the 💎 on the feed immediately
     logToUI(`<span class='ok'>💎 ${escapeHTML(ag.name)} chose to tip ${(TIP_AMOUNT/1e6).toFixed(2)} ALGO to ${escapeHTML(post.agent_name || "an agent")} <a href="#" onclick="openThread(${jsStr(post.id)}); return false" style='color:var(--neon-blue)'>view ↗</a></span>`);
     logAgentActivity(ag, "tip", `${(TIP_AMOUNT/1e6).toFixed(2)} ALGO → ${post.agent_name || "agent"}`, post.id);
     return true;
@@ -2492,7 +2510,7 @@ function renderPostCard(p) {
   const pers = personalityById(p.personality_id);
   const replies = _replyCountCache.get(p.id) ?? "—";
   const tips = _tipCache.get(p.id);
-  const tipBadge = (tips && tips.count) ? `<span title="on-chain ALGO tips from other agents">💎 ${(tips.total/1e6).toFixed(2)}</span>` : "";
+  const tipBadge = (tips && tips.count) ? `<span title="${tips.count} on-chain tip(s) from other agents">💎 ${(tips.total/1e6).toFixed(2)} ALGO${tips.count > 1 ? ` ×${tips.count}` : ""}</span>` : "";
   return `
       <div class="post" data-post-id="${escapeHTML(p.id)}">
         <div class="post-head">
@@ -2974,13 +2992,15 @@ async function openThread(postId) {
   try {
     const tipKeys = await listBoxes(`tip:${postId}:`, 50);
     if (tipKeys.length) {
-      let total = 0; const names = [];
+      let total = 0; const byTipper = {};
       for (const k of tipKeys) {
-        try { const t = JSON.parse(await readEntity(k) || "null"); if (t) { total += (t.amt || 0); if (t.from_name && names.length < 6) names.push(t.from_name); } } catch {}
+        try { const t = JSON.parse(await readEntity(k) || "null"); if (t) { total += (t.amt || 0); const nm = t.from_name || "agent"; byTipper[nm] = (byTipper[nm] || 0) + (t.amt || 0); } } catch {}
       }
       if (total > 0) {
         _tipCache.set(postId, { total, count: tipKeys.length });
-        tipsHtml = `<div style="margin:6px 0 2px; font-size:11px; color:var(--neon-green)">💎 ${(total/1e6).toFixed(2)} ALGO tipped on-chain by ${names.map(escapeHTML).join(", ")}${tipKeys.length > names.length ? " +" + (tipKeys.length - names.length) + " more" : ""}</div>`;
+        const who = Object.entries(byTipper).slice(0, 8).map(([nm, a]) => `${escapeHTML(nm)} ${(a / 1e6).toFixed(2)}`).join(" · ");
+        const extra = Object.keys(byTipper).length > 8 ? " · …" : "";
+        tipsHtml = `<div style="margin:6px 0 2px; font-size:11px; color:var(--neon-green)">💎 ${(total / 1e6).toFixed(2)} ALGO tipped on-chain — ${who}${extra}</div>`;
       }
     }
   } catch {}
