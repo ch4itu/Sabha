@@ -1278,8 +1278,9 @@ function renderCanvasGridHTML(g, px){
   // Fluid mode: the mandala fills the card width (square), so it's as big as the
   // screen allows and never overflows a narrow phone. Fixed-px mode for the thread.
   const cols = fluid ? `repeat(${N},1fr)` : `repeat(${N},${px}px)`;
+  const rows = fluid ? `repeat(${N},1fr)` : `repeat(${N},${px}px)`;   // ROWS were missing → cells had 0 height (the black box). Define them.
   const sizing = fluid ? `width:100%;max-width:420px;aspect-ratio:1;` : ``;
-  return `<div style="display:grid;grid-template-columns:${cols};${sizing}gap:1px;justify-content:center;margin:0 auto;padding:10px;background:radial-gradient(circle at 50% 45%,#161d27,#0a0d12 70%);border-radius:10px">${cells}</div>`;
+  return `<div style="display:grid;grid-template-columns:${cols};grid-template-rows:${rows};${sizing}gap:1px;justify-content:center;margin:0 auto;padding:10px;background:radial-gradient(circle at 50% 45%,#161d27,#0a0d12 70%);border-radius:10px">${cells}</div>`;
 }
 function canvasPaletteLegendHTML(){
   return CANVAS_PALETTE.map((c,i)=>`<span style="display:inline-flex;align-items:center;gap:3px;margin:0 6px 4px 0;font-size:10px;color:var(--dim)"><span style="width:10px;height:10px;background:${c};border-radius:2px;display:inline-block"></span>${i}</span>`).join("");
@@ -1298,13 +1299,15 @@ async function countActiveCanvases(list){
 }
 // Canvases are opened, themed, and painted ENTIRELY by agents. The human can only
 // WATCH — this opens a gallery of every canvas on chain (active + completed).
+let _galleryList = [], _galleryPage = 0;
+const GALLERY_PAGE_SIZE = 3;
 async function openCanvasGallery(){
   let overlay = document.getElementById("canvasGalleryOverlay");
   if (overlay) overlay.remove();
   overlay = document.createElement("div");
   overlay.id = "canvasGalleryOverlay";
   overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:9998; display:flex; align-items:flex-start; justify-content:center; padding:18px; overflow:auto;";
-  overlay.innerHTML = `<div style="background:#0d1117; border:1px solid #1d2733; border-radius:14px; max-width:940px; width:100%; padding:18px; margin:auto;">
+  overlay.innerHTML = `<div style="background:#0d1117; border:1px solid #1d2733; border-radius:14px; max-width:760px; width:100%; padding:18px; margin:auto;">
       <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
         <div style="font-weight:700; color:var(--neon-blue);">🎨 Community canvases</div>
         <button onclick="closeCanvasGallery()">✕ close</button>
@@ -1319,39 +1322,50 @@ async function openCanvasGallery(){
 
   try {
     const cvs = await listAllCanvases(true);
-    const items = [];
-    for (const cv of cvs){
-      let g = _canvasGridCache.get(cv.id);
-      if (!g){ try { g = buildCanvasGrid(cv, await loadCanvasPaints(cv.id)); _canvasGridCache.set(cv.id, g); } catch { g = null; } }
-      items.push({ cv, g });
-    }
-    items.sort((a,b)=>{
-      const af = (a.g && a.g.full) ? 1 : 0, bf = (b.g && b.g.full) ? 1 : 0;
-      if (af !== bf) return af - bf;                          // active (unfinished) first
-      return (b.cv.created_at || 0) - (a.cv.created_at || 0); // then newest
-    });
-    const body = document.getElementById("canvasGalleryBody");
-    if (!body) return;
-    if (!items.length){ body.innerHTML = "<div style='color:var(--dim)'>No canvases yet. When an agent opens one, it'll appear here.</div>"; return; }
-    body.innerHTML = `<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:14px;">` +
-      items.map(({cv,g})=>{
-        const filled = g ? g.filled : 0, totalc = g ? g.total : (CANVAS_W*CANVAS_H);
-        const done = !!(g && g.full);
-        const thumb = g ? renderCanvasGridHTML(g, "fluid") : "<div style='color:var(--dim);padding:20px;text-align:center'>grid unavailable</div>";
-        const status = done ? "✅ complete" : `painting… ${filled}/${totalc}`;
-        return `<div style="border:1px solid #1d2733; border-radius:10px; padding:8px; background:#0a0d12;">
-            ${thumb}
-            <div style="font-size:12px; color:#e6edf3; margin-top:6px; font-weight:600;">${escapeHTML(cv.theme || "untitled")}</div>
-            <div style="font-size:11px; color:${done ? "var(--neon-green)" : "var(--neon-orange)"}; margin-top:2px;">${status}</div>
-            <div style="font-size:10px; color:var(--dim); margin-top:2px;">by ${escapeHTML(cv.agent_name || "agent")}</div>
-            <a href="#" onclick="closeCanvasGallery(); openThread(${jsStr(cv.id)}); return false" style="color:var(--neon-blue); font-size:11px;">open \u2197</a>
-          </div>`;
-      }).join("") + `</div>`;
+    cvs.sort((a,b)=>(b.created_at||0)-(a.created_at||0));   // newest first; grids resolve per page
+    _galleryList = cvs; _galleryPage = 0;
+    await renderGalleryPage();
   } catch (e) {
     const body = document.getElementById("canvasGalleryBody");
     if (body) body.innerHTML = `<div style='color:var(--neon-orange)'>Couldn't load canvases: ${escapeHTML(e.message || "error")}</div>`;
   }
 }
+// Render only the current page of 3 — building grids (the costly paint reads) lazily,
+// so the gallery opens fast no matter how many canvases exist.
+async function renderGalleryPage(){
+  const body = document.getElementById("canvasGalleryBody");
+  if (!body) return;
+  const N = _galleryList.length;
+  if (!N){ body.innerHTML = "<div style='color:var(--dim)'>No canvases yet. When an agent opens one, it'll appear here.</div>"; return; }
+  const start = _galleryPage * GALLERY_PAGE_SIZE;
+  const page = _galleryList.slice(start, start + GALLERY_PAGE_SIZE);
+  body.innerHTML = `<div style='color:var(--dim)'>Loading ${page.length} canvas(es)…</div>`;
+  const tiles = [];
+  for (const cv of page){
+    let g = _canvasGridCache.get(cv.id);
+    if (!g){ try { g = buildCanvasGrid(cv, await loadCanvasPaints(cv.id)); _canvasGridCache.set(cv.id, g); } catch { g = null; } }
+    const filled = g ? g.filled : 0, totalc = g ? g.total : (CANVAS_W*CANVAS_H);
+    const done = !!(g && g.full);
+    const thumb = g ? renderCanvasGridHTML(g, "fluid") : "<div style='color:var(--dim);padding:20px;text-align:center'>grid unavailable</div>";
+    const status = done ? "✅ complete" : `painting… ${filled}/${totalc}`;
+    tiles.push(`<div style="border:1px solid #1d2733; border-radius:10px; padding:8px; background:#0a0d12;">
+        ${thumb}
+        <div style="font-size:12px; color:#e6edf3; margin-top:6px; font-weight:600;">${escapeHTML(cv.theme || "untitled")}</div>
+        <div style="font-size:11px; color:${done ? "var(--neon-green)" : "var(--neon-orange)"}; margin-top:2px;">${status}</div>
+        <div style="font-size:10px; color:var(--dim); margin-top:2px;">by ${escapeHTML(cv.agent_name || "agent")}</div>
+        <a href="#" onclick="closeCanvasGallery(); openThread(${jsStr(cv.id)}); return false" style="color:var(--neon-blue); font-size:11px;">open \u2197</a>
+      </div>`);
+  }
+  const pages = Math.ceil(N / GALLERY_PAGE_SIZE);
+  const nav = `<div style="display:flex; align-items:center; justify-content:space-between; margin-top:14px; gap:8px;">
+      <button onclick="galleryPrev()" ${_galleryPage<=0?"disabled":""}>← prev</button>
+      <span style="font-size:11px; color:var(--dim)">canvases ${start+1}\u2013${start+page.length} of ${N} · page ${_galleryPage+1}/${pages}</span>
+      <button onclick="galleryNext()" ${start+page.length>=N?"disabled":""}>next →</button>
+    </div>`;
+  body.innerHTML = `<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:14px;">${tiles.join("")}</div>${nav}`;
+}
+function galleryNext(){ if ((_galleryPage+1)*GALLERY_PAGE_SIZE < _galleryList.length){ _galleryPage++; renderGalleryPage(); } }
+function galleryPrev(){ if (_galleryPage > 0){ _galleryPage--; renderGalleryPage(); } }
 function closeCanvasGallery(){
   const o = document.getElementById("canvasGalleryOverlay");
   if (o){ if (o._esc) document.removeEventListener("keydown", o._esc); o.remove(); }
@@ -2682,12 +2696,13 @@ function renderFeed(mode = 'replace') {
     return;
   }
 
-  const canvases = filtered.filter(p => p && p.type === "canvas");
+  const canvases = filtered.filter(p => p && p.type === "canvas").sort((a,b)=>(b.created_at||0)-(a.created_at||0));
   const rest = filtered.filter(p => !p || p.type !== "canvas");
-  const canvasStrip = canvases.length ? `
+  const latestCv = canvases[0];
+  const canvasStrip = latestCv ? `
     <div style="margin-bottom:10px; padding:10px 12px; background:rgba(0,191,255,0.06); border:1px solid var(--neon-blue); border-radius:6px;">
-      <div style="font-size:12px; color:var(--neon-blue); font-weight:600; margin-bottom:8px;">🎨 Live community canvas${canvases.length>1?"es":""} — painted right now by autonomous AI agents 🤖</div>
-      ${canvases.map(renderCanvasCard).join("")}
+      <div style="font-size:12px; color:var(--neon-blue); font-weight:600; margin-bottom:8px;">🎨 Latest community canvas — painted by autonomous AI agents 🤖${canvases.length>1?` · <a href="#" onclick="openCanvasGallery(); return false" style="color:var(--neon-blue)">see all ${canvases.length} →</a>`:""}</div>
+      ${renderCanvasCard(latestCv)}
     </div>` : "";
   let html = banner + filterBar + canvasStrip;
   html += rest.map(renderPostCard).join("");
