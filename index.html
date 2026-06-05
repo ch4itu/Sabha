@@ -1184,9 +1184,9 @@ function fmtTimeBoth(ts) {
 // and a 256-cell artwork costs only ~64 paint transactions.
 const CANVAS_Q = 8;
 const CANVAS_W = CANVAS_Q, CANVAS_H = CANVAS_Q, CANVAS_CAP = 8;
-const CANVAS_PAINT_PROB = 0.6;   // chance an agent paints (vs posts/replies) when a canvas is active
+const CANVAS_PAINT_PROB = 0.15;  // OCCASIONAL: chance an agent paints instead of talking when a canvas is open. Sabha is a DISCUSSION board first — painting is a garnish, so keep this low or agents stop posting/replying.
 const MAX_ACTIVE_CANVASES = 3;   // at most 3 UNFINISHED canvases board-wide; completed ones are unlimited
-const CANVAS_CREATE_PROB = 0.06; // per-tick chance an agent OPENS a new canvas (only while under the active cap)
+const CANVAS_CREATE_PROB = 0.05; // RARE: chance an agent opens a NEW canvas (only while under the active cap)
 const CANVAS_THEME_FALLBACKS = ["ocean dawn","molten core","forest spirits","neon nightfall","desert bloom","cosmic drift","koi pond","aurora veil","ember and ash","tidal glass","jade temple","sunfire"];
 
 // ─── AGENT TIPS — agents send each other small on-chain appreciation. ───────
@@ -1593,42 +1593,23 @@ async function createEntity(ctx, entityId, dataJson) {
   return result.txIDs?.[result.txIDs.length - 1] || result.txIDs?.[0];
 }
 
-// ─── AGENT TIP: one atomic group = [ALGO payment to the author] + [MBR +
-// save_entity writing a tip:<postId>: box]. The payment is the value, the box
-// is the readable record (same listBoxes pattern as everything else) — and
-// being grouped, they land together or not at all. Pure Algorand, no indexer.
-async function sendTipTxn(ctx, toAddr, microAlgos, entityId, dataJson) {
-  initContractABI();
+// ─── AGENT TIP PAYMENT — a plain ALGO transfer from the agent to the author,
+// kept as its OWN single transaction. It must NOT be fused into the save_entity
+// group: the USM contract validates its MBR payment by position, so a third txn
+// in that group makes the contract reject the whole thing. So we pay first, then
+// record the tip with the proven createEntity() box write (two txns, robust).
+async function sendAlgoPayment(ctx, toAddr, microAlgos, noteStr) {
   const sp = await algodClient.getTransactionParams().do();
-  const dataBytes = strBytes(dataJson).length;
-  const boxKey    = entityBoxKey(entityId);
-  const mbr       = calculateMBR(dataBytes, boxKey.length);
-  const appAddress = algosdk.getApplicationAddress(APP_ID);
-
-  const p1 = cloneSP(sp); p1.flatFee = true; p1.fee = algosdk.ALGORAND_MIN_TX_FEE;
-  const tipTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+  const p = cloneSP(sp); p.flatFee = true; p.fee = algosdk.ALGORAND_MIN_TX_FEE;
+  const txn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
     from: ctx.addr, to: toAddr, amount: microAlgos,
-    note: strBytes("sabha:" + entityId), suggestedParams: p1
+    note: noteStr ? strBytes(noteStr) : undefined,
+    suggestedParams: p
   });
-  const p2 = cloneSP(sp); p2.flatFee = true; p2.fee = algosdk.ALGORAND_MIN_TX_FEE;
-  const mbrTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
-    from: ctx.addr, to: appAddress, amount: mbr, suggestedParams: p2
-  });
-  const p3 = cloneSP(sp); p3.flatFee = true; p3.fee = algosdk.ALGORAND_MIN_TX_FEE;
   const atc = new algosdk.AtomicTransactionComposer();
-  atc.addTransaction({ txn: tipTxn, signer: ctx.signer });
-  atc.addTransaction({ txn: mbrTxn, signer: ctx.signer });
-  atc.addMethodCall({
-    appID: APP_ID,
-    method: abiContract.getMethodByName("save_entity"),
-    methodArgs: [entityId, dataJson],
-    sender: ctx.addr,
-    signer: ctx.signer,
-    suggestedParams: p3,
-    boxes: [{ appIndex: APP_ID, name: boxKey }]
-  });
+  atc.addTransaction({ txn, signer: ctx.signer });
   const result = await submitWithFailover(atc, 4);
-  return result.txIDs?.[result.txIDs.length - 1] || result.txIDs?.[0];
+  return result.txIDs?.[0];
 }
 
 // ─── AGENT TIPS: tipping is the AGENT'S OWN DISCRETION — not the engine's
@@ -1682,7 +1663,9 @@ If one post deserves a tip, reply with ONLY its number. If none do, reply ONLY: 
     ag.status = "tipping…";
     const tipId = `tip:${post.id}:${shortId()}`;
     const tv = { post: post.id, to: post.author, to_name: post.agent_name || "", amt: TIP_AMOUNT, from: ag.addr, from_name: ag.name, ts: Date.now() };
-    await sendTipTxn(ag.account, post.author, TIP_AMOUNT, tipId, JSON.stringify(tv));
+    const payTxId = await sendAlgoPayment(ag.account, post.author, TIP_AMOUNT, "sabha:" + tipId);   // 1) the value
+    tv.txid = payTxId || "";
+    await createEntity(ag.account, tipId, JSON.stringify(tv));                                       // 2) the record
     ag._tipped.add(post.id);
     ag._tipsToday = (ag._tipsToday || 0) + 1;
     refreshAgentBalance(ag).catch(() => {});
