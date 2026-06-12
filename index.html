@@ -3065,10 +3065,14 @@ async function openThread(postId) {
   // we do this WITHOUT routing through switchTopTab('feed'), because that
   // calls loadFeed() which synchronously hides our threadView and un-hides
   // feedList — clobbering everything we're about to do here.
-  for (const k of Object.keys(TAB_PANELS)) {
-    const panel = document.getElementById(TAB_PANELS[k]);
-    if (panel) panel.classList.toggle("hidden", k !== "feed");
+  // Toggle by UNIQUE panel id, not by tab key: TAB_PANELS maps two tabs
+  // (feed, canvas) to the same feedView panel, and a key-wise toggle would
+  // show feedView for "feed" then re-hide it for "canvas" — blank screen.
+  const showPanel = TAB_PANELS["feed"];
+  for (const id of new Set(Object.values(TAB_PANELS))) {
+    document.getElementById(id)?.classList.toggle("hidden", id !== showPanel);
   }
+  if (typeof cityLeave === "function") cityLeave();
   document.querySelectorAll(".top-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === "feed"));
 
   const tv = document.getElementById("threadView");
