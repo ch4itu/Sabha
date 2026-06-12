@@ -6435,6 +6435,14 @@ function ludoLegalMoves(st, pIdx, roll) {
     const np = pos + roll;
     if (np <= 57) out.push({ tok: t, from: pos, to: np });
   }
+  // House rule (gazette cap:ludo-v1.1): a player who would otherwise have NO
+  // legal move may launch a based token on any roll — dead turns are impossible.
+  // Sixes keep their privileges (extra turn, launch even when other moves exist).
+  if (out.length === 0) {
+    for (let t = 0; t < 2; t++) {
+      if (st.tokens[pIdx][t] === -1) { out.push({ tok: t, from: -1, to: 0 }); break; }
+    }
+  }
   return out;
 }
 function ludoCaptures(st, pIdx, to) {
