@@ -296,22 +296,7 @@
       <span style="margin-left:auto; font-size:11px;" class="dim" id="cityStatus">waking the city…</span>
     </div>
     <canvas id="cityCanvas" width="704" height="480"
-            style="width:100%; display:block; touch-action:none; border:1px solid var(--border); border-radius:6px; background:#0a0d12; cursor:grab;"></canvas>
-    <div class="row" style="gap:6px; margin-top:6px; flex-wrap:wrap; align-items:center;">
-      <button class="ghost" onclick="cityRotate(-Math.PI/2)" title="rotate left">⟲</button>
-      <button class="ghost" onclick="cityRotate(Math.PI/2)" title="rotate right">⟳</button>
-      <button class="ghost" onclick="cityZoom(1.25)" title="zoom in">➕</button>
-      <button class="ghost" onclick="cityZoom(0.8)" title="zoom out">➖</button>
-      <button class="ghost" onclick="citySetPitch(0.04)">⬇ top</button>
-      <button class="ghost" onclick="citySetPitch(0.96)">◈ iso</button>
-      <button class="ghost" onclick="citySetPitch(1.28)">⬈ low</button>
-      <button class="ghost" onclick="cityToggleSpin()">▶ spin</button>
-      <button class="ghost" onclick="cityRecenter()" title="recenter view">⊕ center</button>
-      <span class="dim" style="font-size:10px;">drag to orbit · two-finger drag to pan · pinch / ➕➖ to zoom · tap a citizen for profile · tap 🎲 hall</span>
-    </div>
-    <div class="dim" style="font-size:11px; margin-top:4px; text-align:center; letter-spacing:0.3px;">
-      👆 one finger — rotate &amp; tilt&nbsp;&nbsp;·&nbsp;&nbsp;✌️ two fingers — move&nbsp;&nbsp;·&nbsp;&nbsp;🤏 pinch — zoom
-    </div>
+            style="width:100%; display:block; touch-action:pinch-zoom; image-rendering:pixelated; border:1px solid var(--border); border-radius:6px; background:#0a0d12; cursor:pointer;"></canvas>
     <div id="cityTicker" class="dim" style="font-size:11px; margin-top:6px; min-height:14px;"></div>
   </div>
 </div>
@@ -6294,129 +6279,121 @@ const _cityTipCacheBoxes = new Map();
 
 function _cityRngOf(str) { return _faceRng(_faceHash(String(str))); }
 function _citySmooth(k) { return k * k * (3 - 2 * k); }
-function _roundRect(g, x, y, w, h, r) {
-  g.beginPath();
-  g.moveTo(x+r, y); g.arcTo(x+w, y, x+w, y+h, r); g.arcTo(x+w, y+h, x, y+h, r);
-  g.arcTo(x, y+h, x, y, r); g.arcTo(x, y, x+w, y, r); g.closePath();
-}
 
-// ── world layout (units, ~0..9). Iso projection maps these to screen. ────────
-const CITY_W = 9;                                            // world span
+// ── layout: Assembly in the center, 7 ward plots, Rest House in the SE ───────
 const _CITY_PLOTS = [
-  { wx: 4.5, wy: 4.5 },                                      // 0: Assembly (general)
-  { wx: 4.5, wy: 1.1 }, { wx: 7.9, wy: 1.7 }, { wx: 8.1, wy: 4.6 },
-  { wx: 1.2, wy: 1.6 }, { wx: 1.0, wy: 4.6 }, { wx: 1.7, wy: 7.9 }, { wx: 4.7, wy: 8.1 },
+  { x: 22, y: 14 },                                           // 0: Assembly (general)
+  { x: 8,  y: 7 }, { x: 34, y: 7 }, { x: 8, y: 22 },
+  { x: 22, y: 5 }, { x: 15, y: 24 }, { x: 5, y: 15 }, { x: 38, y: 13 },
 ];
-const _CITY_REST = { wx: 8.0, wy: 7.9 };                     // Rest House
-const _CITY_HALL = { wx: 6.3, wy: 6.4 };                     // Game Hall
-const _CITY_POND = { wx: 9.2, wy: -0.4 };                    // pond (no building)
-const _CITY_MC   = { x: 4.5, y: 4.2 };                       // orbit center
-
-// camera (yaw + pitch + zoom), eased toward targets each frame
-let _camTheta = 0, _camThetaT = 0, _camPhi = 0.96, _camPhiT = 0.96, _camSpin = false;
-let _camZoom = 1, _camZoomT = 1;
-let _camPanX = 0, _camPanY = 0;                              // screen-space pan offset
-const CAM_OX = 352, CAM_OY = 172, CAM_U = 30;               // screen origin + base scale
-function _camScale() { return (15 + 13 * Math.sin(Math.min(_camPhi, 1.3))) * _camZoom; }
-
-let _cityGame = null;
-let _cityGamesIndex = [];
-const _cityGameBoxCache = new Map();
-let _ludoSel = null;
-let _ludoStep = -1;
-let _cityGameSet = new Set();
-const _cityMoveCache = new Map();
+const _CITY_REST = { x: 34, y: 23 };                          // Rest House plot
+const _CITY_HALL = { x: 29, y: 18 };                          // Game Hall plot
+let _cityGame = null;                                          // latest ludo {gid,box,moves,st}
+let _cityGamesIndex = [];                                      // all matches, newest first [{gid,box}]
+const _cityGameBoxCache = new Map();                           // gid -> game box (immutable once done)
+let _ludoSel = null;                                           // viewer selection {gid,box,moves}
+let _ludoStep = -1;                                            // replay position (-1 = live end)
+let _cityGameSet = new Set();                                  // addrs seated at the table
+const _cityMoveCache = new Map();                              // immutable move boxes
 const _CITY_ROOFS = ["#d04848","#4878d0","#e08830","#9858c8","#38a098","#d06890","#c8b030"];
 
-// ── orbit projection: world (wx,wy,wz) → screen, via yaw θ + pitch φ ─────────
-function _camRot(wx, wy) {
-  const dx = wx - _CITY_MC.x, dy = wy - _CITY_MC.y, c = Math.cos(_camTheta), s = Math.sin(_camTheta);
-  return { x: _CITY_MC.x + dx * c - dy * s, y: _CITY_MC.y + dx * s + dy * c };
+// ── terrain: bright GBA-city palette, generated once, seeded by APP_ID ────
+function _cityDrawTree(g, px, py, rng) {
+  g.fillStyle = "#7a4a2a"; g.fillRect(px-2, py+2, 4, 5);
+  g.fillStyle = "#2e6e34"; g.beginPath(); g.arc(px, py-2, 8, 0, Math.PI*2); g.fill();
+  g.fillStyle = "#48a04c"; g.beginPath(); g.arc(px-1, py-4, 6, 0, Math.PI*2); g.fill();
+  g.fillStyle = "#66c266"; g.beginPath(); g.arc(px-3, py-6, 2.5, 0, Math.PI*2); g.fill();
 }
-function cityProj(wx, wy, wz = 0) {
-  const r = _camRot(wx, wy), a = r.x - r.y, b = r.x + r.y, U = _camScale();
-  return { x: CAM_OX + _camPanX + a * U * 0.86, y: CAM_OY + _camPanY + b * U * 0.86 * Math.cos(_camPhi) - wz * Math.sin(_camPhi) };
-}
-function cityDepth(wx, wy) { const r = _camRot(wx, wy); return r.x + r.y; }
-
-// ── orbit renderer helpers ──────────────────────────────────────────────────
-function _cityShade(hex, f){ const n=parseInt(hex.slice(1),16); let r=(n>>16)&255,gg=(n>>8)&255,b=n&255; r=Math.min(255,r*f|0); gg=Math.min(255,gg*f|0); b=Math.min(255,b*f|0); return `rgb(${r},${gg},${b})`; }
-function _cityPoly(g, pts, col){ g.fillStyle=col; g.beginPath(); g.moveTo(pts[0].x,pts[0].y); for(let i=1;i<pts.length;i++)g.lineTo(pts[i].x,pts[i].y); g.closePath(); g.fill(); }
-
-// ── island: organic landmass ringed by animated sea (no trees) ──────────────
-function cityDrawGround(g, t){
-  // full-canvas sea backdrop with gentle moving bands
-  const sea = g.createLinearGradient(0,0,0,CITY_PXH);
-  sea.addColorStop(0,"#1d5a82"); sea.addColorStop(1,"#11425f");
-  g.fillStyle = sea; g.fillRect(0,0,CITY_PXW,CITY_PXH);
-  g.globalAlpha = 0.10; g.strokeStyle = "#bfe4fb"; g.lineWidth = 2;
-  for(let i=0;i<7;i++){ const y=((t/40 + i*70) % (CITY_PXH+80)) - 40; g.beginPath(); for(let x=0;x<=CITY_PXW;x+=24) g.lineTo(x, y + Math.sin((x+t/12)/40)*4); g.stroke(); }
-  g.globalAlpha = 1;
-
-  // island outline: a smooth closed blob around the plots, in screen space
-  const rim = 2.0;                                   // how far the shore extends past the plots
-  const pts = [];
-  for(let a=0; a<360; a+=18){
-    const rad = a*Math.PI/180;
-    const wob = 1 + 0.12*Math.sin(rad*3) + 0.06*Math.cos(rad*5);
-    const wx = _CITY_MC.x + Math.cos(rad) * (4.8*rim*0.62) * wob;
-    const wy = _CITY_MC.y + Math.sin(rad) * (4.8*rim*0.62) * wob;
-    pts.push(cityProj(wx, wy));
+function cityBuildGround() {
+  const c = document.createElement("canvas");
+  c.width = CITY_PXW; c.height = CITY_PXH;
+  const g = c.getContext("2d");
+  const rng = _cityRngOf("ground|" + APP_ID);
+  // checkered meadow
+  for (let ty = 0; ty < CITY_TH * 2; ty++) for (let tx = 0; tx < CITY_TW * 2; tx++) {
+    g.fillStyle = (tx + ty) % 2 ? "#88c070" : "#80b868";
+    g.fillRect(tx * 8, ty * 8, 8, 8);
   }
-  const blob = (off, col) => { g.fillStyle = col; g.beginPath(); g.moveTo(pts[0].x, pts[0].y+off); for(let i=1;i<pts.length;i++) g.lineTo(pts[i].x, pts[i].y+off); g.closePath(); g.fill(); };
-  // soft underwater shadow, then sand beach, then a thin foam ring, then grass
-  g.globalAlpha = 0.35; blob(10, "#0c3047"); g.globalAlpha = 1;
-  blob(4, "#e6d3a3");                                 // sand
-  g.save();
-  g.beginPath(); g.moveTo(pts[0].x, pts[0].y); for(let i=1;i<pts.length;i++) g.lineTo(pts[i].x, pts[i].y); g.closePath(); g.clip();
-  // grass fill (slightly inset look via gradient)
-  const ys = pts.map(p=>p.y), gr = g.createLinearGradient(0, Math.min(...ys), 0, Math.max(...ys));
-  gr.addColorStop(0,"#6fb061"); gr.addColorStop(1,"#508c46");
-  g.fillStyle = gr; g.beginPath(); g.moveTo(pts[0].x, pts[0].y); for(let i=1;i<pts.length;i++) g.lineTo(pts[i].x, pts[i].y); g.closePath(); g.fill();
-  // gentle inner meadow glow
-  for(const [wx,wy,col] of [[3.4,3.4,"#7cc06a"],[6,5.4,"#5f9e54"],[4.6,6.4,"#74b866"]]){
-    const p=cityProj(wx,wy); const rg=g.createRadialGradient(p.x,p.y,4,p.x,p.y,120);
-    rg.addColorStop(0,col+"99"); rg.addColorStop(1,col+"00"); g.fillStyle=rg;
-    g.beginPath(); g.ellipse(p.x,p.y,120,72,0,0,Math.PI*2); g.fill();
+  // sparse flowers + grass tufts
+  for (let i = 0; i < 260; i++) {
+    const px = rng()*CITY_PXW, py = rng()*CITY_PXH, r = rng();
+    if (r < 0.18) { g.fillStyle = "#e85858"; g.fillRect(px, py, 3, 3); g.fillStyle = "#f8e858"; g.fillRect(px+1, py+1, 1, 1); }
+    else if (r < 0.34) { g.fillStyle = "#f8f8a8"; g.fillRect(px, py, 3, 3); }
+    else { g.fillStyle = "#6ca858"; g.fillRect(px, py, 4, 2); }
   }
-  // paths assembly → every plot, rest, hall
-  g.lineCap="round"; const A=_CITY_PLOTS[0];
-  const lane=(B)=>{ const p0=cityProj(A.wx,A.wy), p1=cityProj(B.wx,B.wy); g.strokeStyle="rgba(222,202,150,0.55)"; g.lineWidth=13; g.beginPath(); g.moveTo(p0.x,p0.y); g.lineTo(p1.x,p1.y); g.stroke(); };
-  for(let i=1;i<_CITY_PLOTS.length;i++) lane(_CITY_PLOTS[i]);
-  lane(_CITY_REST); lane(_CITY_HALL);
-  for(const P of [..._CITY_PLOTS,_CITY_REST,_CITY_HALL]){ const p=cityProj(P.wx,P.wy); const rg=g.createRadialGradient(p.x,p.y,2,p.x,p.y,30); rg.addColorStop(0,"rgba(40,30,16,0.24)"); rg.addColorStop(1,"rgba(40,30,16,0)"); g.fillStyle=rg; g.beginPath(); g.ellipse(p.x,p.y,30,15,0,0,Math.PI*2); g.fill(); }
-  g.restore();
-  // foam ring on top of the shore
-  g.strokeStyle = "rgba(255,255,255,0.5)"; g.lineWidth = 2;
-  g.beginPath(); g.moveTo(pts[0].x, pts[0].y+4); for(let i=1;i<pts.length;i++) g.lineTo(pts[i].x, pts[i].y+4); g.closePath(); g.stroke();
+  // tan paths: Assembly to every plot + Rest House (L-shaped, a full tile wide)
+  const P0 = _CITY_PLOTS[0];
+  const lane = (A, B) => {
+    const x0 = Math.min(A.x, B.x), x1 = Math.max(A.x, B.x);
+    for (let x = x0; x <= x1; x++) { g.fillStyle = "#e0c890"; g.fillRect(x*CITY_TILE, (B.y+1)*CITY_TILE+2, CITY_TILE, 12); g.fillStyle = "#c8a868"; g.fillRect(x*CITY_TILE, (B.y+1)*CITY_TILE+2, CITY_TILE, 2); }
+    const y0 = Math.min(A.y, B.y), y1 = Math.max(A.y, B.y);
+    for (let y = y0; y <= y1+1; y++) { g.fillStyle = "#e0c890"; g.fillRect(A.x*CITY_TILE+2, y*CITY_TILE, 12, CITY_TILE); g.fillStyle = "#c8a868"; g.fillRect(A.x*CITY_TILE+2, y*CITY_TILE, 2, CITY_TILE); }
+  };
+  for (let i = 1; i < _CITY_PLOTS.length; i++) lane(P0, _CITY_PLOTS[i]);
+  lane(P0, _CITY_REST);
+  lane(P0, _CITY_HALL);
+  // plot pads (packed-earth aprons in front of each house)
+  for (const P of [..._CITY_PLOTS, _CITY_REST, _CITY_HALL]) {
+    g.fillStyle = "#e8d8a8";
+    g.beginPath(); g.ellipse((P.x+0.5)*CITY_TILE, (P.y+1.6)*CITY_TILE, 34, 17, 0, 0, Math.PI*2); g.fill();
+    g.strokeStyle = "#c8a868"; g.lineWidth = 1; g.stroke();
+  }
+  // pond (NE), GBA blue
+  g.fillStyle = "#58a8f0";
+  g.beginPath(); g.ellipse(40.4*CITY_TILE, 3.4*CITY_TILE, 3.4*CITY_TILE, 2.1*CITY_TILE, 0, 0, Math.PI*2); g.fill();
+  g.fillStyle = "#88c8f8"; g.beginPath(); g.ellipse(40.4*CITY_TILE, 3.4*CITY_TILE, 2.4*CITY_TILE, 1.3*CITY_TILE, 0, 0, Math.PI*2); g.fill();
+  g.strokeStyle = "#3878b8"; g.lineWidth = 2;
+  g.beginPath(); g.ellipse(40.4*CITY_TILE, 3.4*CITY_TILE, 3.4*CITY_TILE, 2.1*CITY_TILE, 0, 0, Math.PI*2); g.stroke();
+  // forest: 2-deep jittered tree border + a few inner groves
+  const nearPlot = (tx, ty) => [..._CITY_PLOTS, _CITY_REST, _CITY_HALL].some(P => Math.abs(P.x-tx) < 4.5 && Math.abs(P.y-ty) < 4);
+  for (let tx = 0; tx < CITY_TW; tx += 1) for (const ty of [0.4, 1.5]) {
+    if (!(tx > 35 && ty < 6)) _cityDrawTree(g, tx*CITY_TILE+8+(rng()*6-3), ty*CITY_TILE+8+(rng()*4-2), rng);
+  }
+  for (let tx = 0; tx < CITY_TW; tx += 1) for (const ty of [CITY_TH-1.5, CITY_TH-0.5])
+    _cityDrawTree(g, tx*CITY_TILE+8+(rng()*6-3), ty*CITY_TILE+8+(rng()*4-2), rng);
+  for (let ty = 2; ty < CITY_TH-2; ty += 1) for (const tx of [0.4, 1.4, CITY_TW-1.5, CITY_TW-0.6])
+    _cityDrawTree(g, tx*CITY_TILE+8+(rng()*4-2), ty*CITY_TILE+8+(rng()*6-3), rng);
+  for (let i = 0; i < 46; i++) {
+    const tx = 3 + rng()*(CITY_TW-6), ty = 3 + rng()*(CITY_TH-6);
+    if (tx > 34 && ty < 7) continue;
+    if (nearPlot(tx, ty) || rng() < 0.35) continue;
+    _cityDrawTree(g, tx*CITY_TILE, ty*CITY_TILE, rng);
+  }
+  return c;
 }
 
-// ── rotation-aware cottage: front corner detected per frame ─────────────────
-function cityCottage(g, P, roof, big, lit, label, hot, t){
-  const w = big ? 0.85 : 0.62, wallH = big ? 42 : 34, roofH = big ? 26 : 22;
-  const cs=[[-w,-w],[w,-w],[w,w],[-w,w]];
-  const base = cs.map(([dx,dy])=>cityProj(P.wx+dx,P.wy+dy,0));
-  const top  = cs.map(([dx,dy])=>cityProj(P.wx+dx,P.wy+dy,wallH));
-  let fi=0; for(let i=1;i<4;i++) if(base[i].y>base[fi].y) fi=i;
-  const Ln=(fi+3)%4, Rn=(fi+1)%4, Bk=(fi+2)%4;
-  let li=Ln, ri=Rn; if(base[li].x>base[ri].x){ li=Rn; ri=Ln; }
-  const ctr=cityProj(P.wx,P.wy), cx=ctr.x;
-  g.fillStyle="rgba(0,0,0,0.22)"; g.beginPath(); g.ellipse(cx, base[fi].y+2, (big?44:32),(big?19:14),0,0,Math.PI*2); g.fill();
-  _cityPoly(g,[base[li],base[fi],top[fi],top[li]], "#ece0c8");
-  _cityPoly(g,[base[fi],base[ri],top[ri],top[fi]], "#cdbea1");
-  _cityPoly(g,[top[li],top[fi],top[ri],{x:top[ri].x,y:top[ri].y+3},{x:top[fi].x,y:top[fi].y+3},{x:top[li].x,y:top[li].y+3}], "rgba(0,0,0,0.10)");
-  const lm={x:(top[li].x+top[fi].x)/2,y:(top[li].y+top[fi].y)/2+wallH*0.40};
-  g.fillStyle=lit?"#ffd86a":"#bcd8e6"; g.beginPath(); g.moveTo(lm.x-5,lm.y-2);g.lineTo(lm.x+5,lm.y);g.lineTo(lm.x+5,lm.y+7);g.lineTo(lm.x-5,lm.y+5);g.closePath(); g.fill();
-  const dm={x:(base[fi].x+base[ri].x)/2,y:(base[fi].y+base[ri].y)/2}; g.fillStyle="#7a5436";
-  g.beginPath(); g.moveTo(dm.x-4,dm.y-1);g.lineTo(dm.x+4,dm.y+1);g.lineTo(dm.x+4,dm.y-14);g.lineTo(dm.x-4,dm.y-16);g.closePath(); g.fill();
-  const apex = cityProj(P.wx, P.wy, wallH+roofH);
-  const faces=[[Bk,Ln],[Bk,Rn],[Ln,fi],[Rn,fi]].map(([p,q])=>({p,q,my:(top[p].y+top[q].y)/2}));
-  faces.sort((p,q)=>p.my-q.my);
-  const wallTopY = cityProj(P.wx,P.wy,wallH).y;
-  for(const f of faces){ const mx=(top[f.p].x+top[f.q].x)/2; const bright=0.78+Math.max(0,(cx-mx))/120*0.4+(f.my>wallTopY?0.12:0); _cityPoly(g,[top[f.p],top[f.q],apex], _cityShade(roof, Math.min(1.2,bright))); }
-  g.strokeStyle="rgba(255,255,255,0.18)"; g.lineWidth=1; g.beginPath(); g.moveTo(top[fi].x,top[fi].y);g.lineTo(apex.x,apex.y); g.stroke();
-  if(hot){ g.fillStyle="rgba(220,225,235,0.5)"; for(let i=0;i<3;i++){ const k=((t/950)+i*0.33)%1; g.beginPath(); g.arc(apex.x+Math.sin(k*6)*3, apex.y-6-k*16, 2+k*3,0,Math.PI*2); g.fill(); } }
-  if(label){ g.font="bold 10px monospace"; g.textAlign="center"; const lw=g.measureText(label).width+12; g.fillStyle="rgba(18,24,30,0.82)"; _roundRect(g, cx-lw/2, base[fi].y+6, lw, 15, 7); g.fill(); g.fillStyle="#eaf2f8"; g.fillText(label, cx, base[fi].y+17); }
+// ── houses: drawn every frame so wards can re-assign as topics rise and fall ──────
+function _cityHouse(g, px, py, roof, wide, lit, label, hot) {
+  const W = wide ? 64 : 46, H = wide ? 30 : 24, R = wide ? 16 : 13;
+  const x = px - W/2, y = py - H;
+  // walls
+  g.fillStyle = "#f0e0c0"; g.fillRect(x, y, W, H);
+  g.strokeStyle = "#8a6a48"; g.lineWidth = 1; g.strokeRect(x+0.5, y+0.5, W-1, H-1);
+  // roof with ridge + overhang
+  g.fillStyle = roof; g.fillRect(x-3, y-R, W+6, R);
+  g.fillStyle = "rgba(255,255,255,0.25)"; g.fillRect(x-3, y-R, W+6, 3);
+  g.fillStyle = "rgba(0,0,0,0.18)"; g.fillRect(x-3, y-3, W+6, 3);
+  // door
+  g.fillStyle = "#7a4a2a"; g.fillRect(px-4, y+H-11, 8, 11);
+  g.fillStyle = "#5a3a20"; g.fillRect(px-4, y+H-11, 8, 2);
+  // windows (lit at night or when ward is hot)
+  g.fillStyle = lit ? "#ffe080" : "#a8d8f0";
+  g.fillRect(x+6, y+6, 8, 7); g.fillRect(x+W-14, y+6, 8, 7);
+  g.strokeStyle = "#8a6a48"; g.strokeRect(x+6.5, y+6.5, 7, 6); g.strokeRect(x+W-13.5, y+6.5, 7, 6);
+  if (hot) { // chimney smoke when the ward spoke recently
+    g.fillStyle = "#9a9aa8"; g.fillRect(x+W-10, y-R-6, 5, 6);
+    g.fillStyle = "rgba(220,220,230,0.6)";
+    const t = performance.now();
+    for (let i = 0; i < 3; i++) { const k = ((t/900)+i*0.33)%1; g.beginPath(); g.arc(x+W-7+Math.sin(k*6)*3, y-R-8-k*14, 2+k*3, 0, Math.PI*2); g.fill(); }
+  }
+  // sign
+  if (label) {
+    g.font = "bold 10px monospace"; g.textAlign = "center";
+    const w = g.measureText(label).width + 8;
+    g.fillStyle = "#c89858"; g.fillRect(px-w/2, py+3, w, 13);
+    g.strokeStyle = "#8a6a48"; g.strokeRect(px-w/2+0.5, py+3.5, w-1, 12);
+    g.fillStyle = "#4a3318"; g.fillText(label, px, py+13);
+  }
 }
 
 // ── citizen sprites: tiny canvases from the SAME face cells as the feed ─────
@@ -6780,8 +6757,8 @@ async function cityLoadData() {
     for (const v of _cityPop) { const t = v.ev?.topic || v.topic; heat.set(t, (heat.get(t)||0) + 1 + ((nowTs-(v.ev?.ts||0) < CITY_FRESH_MS) ? 2 : 0)); }
     heat.delete("general");
     const ring = [...heat.entries()].sort((a, b) => b[1]-a[1]).slice(0, _CITY_PLOTS.length-1).map(e => e[0]);
-    _cityWards = [{ topic: "general", wx: _CITY_PLOTS[0].wx, wy: _CITY_PLOTS[0].wy, roof: "#6888a8" }];
-    ring.forEach((t, i) => _cityWards.push({ topic: t, wx: _CITY_PLOTS[i+1].wx, wy: _CITY_PLOTS[i+1].wy, roof: _CITY_ROOFS[i % _CITY_ROOFS.length] }));
+    _cityWards = [{ topic: "general", ..._CITY_PLOTS[0], roof: "#6888a8" }];
+    ring.forEach((t, i) => _cityWards.push({ topic: t, ..._CITY_PLOTS[i+1], roof: _CITY_ROOFS[i % _CITY_ROOFS.length] }));
     for (const w of _cityWards) {
       w.lastTs = 0;
       for (const v of _cityPop) if ((v.ev?.topic||v.topic) === w.topic && (v.ev?.ts||0) > w.lastTs) w.lastTs = v.ev.ts;
@@ -6798,133 +6775,125 @@ async function cityLoadData() {
   } finally { _cityLoading = false; }
 }
 
-// ── positions in WORLD units: pure f(addr, t, chain) ────────────────────────
-function cityWardWorld(topic) {
+// ── positions: pure f(addr, t, chain) ────────────────────────────────────────
+function cityWardPos(topic) {
   const w = _cityWards.find(w => w.topic === topic) || _cityWards[0] || _CITY_PLOTS[0];
-  return { wx: w.wx, wy: w.wy + 1.1 };               // stand in front of the house
+  return { x: (w.x + 0.5) * CITY_TILE, y: (w.y + 1.7) * CITY_TILE };   // the pad in front
 }
-function cityCitizenWorld(v, t) {
+function cityCitizenPos(v, t) {
   const home = _cityGameSet.has(v.addr)
-    ? { wx: _CITY_HALL.wx, wy: _CITY_HALL.wy + 1.0 }
-    : cityWardWorld(v.ev?.topic || v.topic);
-  if (!v.glide) v.glide = { wx: home.wx, wy: home.wy };
-  v.glide.wx += (home.wx - v.glide.wx) * 0.02;
-  v.glide.wy += (home.wy - v.glide.wy) * 0.02;
+    ? { x: (_CITY_HALL.x + 0.5) * CITY_TILE, y: (_CITY_HALL.y + 1.7) * CITY_TILE }
+    : cityWardPos(v.ev?.topic || v.topic);
+  if (!v.glide) v.glide = { x: home.x, y: home.y };
+  v.glide.x += (home.x - v.glide.x) * 0.02;
+  v.glide.y += (home.y - v.glide.y) * 0.02;
   const EPOCH = 9000;
   const e = Math.floor(t / EPOCH), k = _citySmooth((t % EPOCH) / EPOCH);
-  const off = (ep) => { const r = _cityRngOf(v.addr + "|" + ep); const ang = r() * Math.PI * 2, rad = 0.3 + r() * 0.9; return { wx: Math.cos(ang) * rad, wy: Math.sin(ang) * rad }; };
+  const off = (ep) => {
+    const r = _cityRngOf(v.addr + "|" + ep);
+    const ang = r() * Math.PI * 2, rad = 10 + r() * 30;
+    return { x: Math.cos(ang) * rad, y: Math.sin(ang) * rad * 0.55 };
+  };
   const a = off(e), b = off(e + 1);
-  return { wx: v.glide.wx + a.wx + (b.wx - a.wx) * k, wy: v.glide.wy + a.wy + (b.wy - a.wy) * k };
+  return { x: v.glide.x + a.x + (b.x - a.x) * k, y: v.glide.y + a.y + (b.y - a.y) * k };
 }
-function cityRestWorld(idx) {
-  return { wx: _CITY_REST.wx - 0.9 + (idx % 4) * 0.6, wy: _CITY_REST.wy + 1.0 + Math.floor(idx / 4) * 0.55 };
+function cityRestPos(idx) {
+  const bx = (_CITY_REST.x + 0.5) * CITY_TILE, by = (_CITY_REST.y + 1.6) * CITY_TILE;
+  return { x: bx - 36 + (idx % 5) * 18, y: by - 2 + Math.floor(idx / 5) * 17 };
 }
 
-// ── render loop (orbit camera, depth-sorted) ────────────────────────────────
+// ── render loop ──────────────────────────────────────────────────────────────
 function cityDraw(t) {
   if (!_cityActive) return;
   const cv = document.getElementById("cityCanvas");
   if (!cv) return;
   const g = cv.getContext("2d");
-  g.imageSmoothingEnabled = true;
+  g.imageSmoothingEnabled = false;
+  if (!_cityGround) _cityGround = cityBuildGround();
+  g.drawImage(_cityGround, 0, 0);
 
-  // ease camera toward targets
-  if (_camSpin) _camThetaT += 0.004;
-  _camTheta += (_camThetaT - _camTheta) * 0.12;
-  _camPhi   += (_camPhiT   - _camPhi)   * 0.12;
-  _camZoom  += (_camZoomT  - _camZoom)  * 0.18;
+  // pond sparkle
+  g.fillStyle = "rgba(255,255,255,0.5)";
+  for (let i = 0; i < 3; i++) {
+    const sx = 40.4*CITY_TILE + Math.sin(t/700 + i*2.1) * 26, sy = 3.4*CITY_TILE + Math.cos(t/900 + i) * 12;
+    g.fillRect(sx, sy, 6, 2);
+  }
 
-  g.clearRect(0, 0, CITY_PXW, CITY_PXH);
-  g.fillStyle = "#0a0d12"; g.fillRect(0, 0, CITY_PXW, CITY_PXH);
-
-  // shared day/night clock
-  const CITY_DAY_MS = 20 * 60_000;
+  const CITY_DAY_MS = 15 * 60_000;                 // one full day/night every 15 min
   const h = ((Date.now() % CITY_DAY_MS) / CITY_DAY_MS) * 24;
   const isNight = h >= 19 || h < 6;
 
-  cityDrawGround(g, t);
-
-  // citizen world positions (+ collision spread in world units)
-  const rawList = _cityPop.map(v => ({ v, w: cityCitizenWorld(v, t) }));
-  for (let iter = 0; iter < 5; iter++) {
-    for (let i = 0; i < rawList.length; i++) for (let j = i + 1; j < rawList.length; j++) {
-      const A = rawList[i].w, B = rawList[j].w;
-      let dx = B.wx - A.wx, dy = B.wy - A.wy; const d = Math.hypot(dx, dy) || 0.01, MIN = 0.7;
-      if (d < MIN) { const push = (MIN - d) / 2; dx /= d; dy /= d; A.wx -= dx*push; A.wy -= dy*push; B.wx += dx*push; B.wy += dy*push; }
-    }
-  }
-
-  // build a single depth-sorted draw list: houses + awake citizens + resting
-  const items = [];
+  // houses: wards + Assembly + Rest House
   for (const w of _cityWards) {
-    const hot = Date.now() - (w.lastTs||0) < 15*60_000;
-    items.push({ d: cityDepth(w.wx, w.wy), z: 0, draw: () => cityCottage(g, w, w.roof, w.topic === "general", isNight || hot, (w.topic === "general" ? "🏛 #general" : "#" + w.topic), hot, t) });
+    const px = (w.x+0.5)*CITY_TILE, py = (w.y+0.9)*CITY_TILE;
+    const hot = Date.now() - (w.lastTs||0) < 15 * 60_000;
+    _cityHouse(g, px, py, w.roof, w.topic === "general", isNight || hot, (w.topic === "general" ? "🏛 assembly · #general" : "#" + w.topic), hot);
   }
-  items.push({ d: cityDepth(_CITY_REST.wx, _CITY_REST.wy), z: 0, draw: () => cityCottage(g, _CITY_REST, "#8a7aa8", true, isNight, "🛏 rest", false, t) });
+  _cityHouse(g, (_CITY_REST.x+0.5)*CITY_TILE, (_CITY_REST.y+0.9)*CITY_TILE, "#8a7a9a", true, isNight, "🛏 rest house", false);
   { const live = _cityGameSet.size > 0;
-    items.push({ d: cityDepth(_CITY_HALL.wx, _CITY_HALL.wy), z: 0, draw: () => cityCottage(g, _CITY_HALL, "#48a058", false, isNight || live, "🎲 hall", live, t) }); }
+    _cityHouse(g, (_CITY_HALL.x+0.5)*CITY_TILE, (_CITY_HALL.y+0.9)*CITY_TILE, "#48a058", false, isNight || live, "🎲 game hall", live); }
 
-  // tips: 💎 arcs (projected)
-  const posScreen = new Map();
-  for (const d of rawList) posScreen.set(d.v.addr, cityProj(d.w.wx, d.w.wy));
-  const tipDraws = [];
+  // tips: 💎 arcs
+  const posOf = new Map();
+  const drawList = _cityPop.map(v => ({ v, p: cityCitizenPos(v, t) }));
+  for (const d of drawList) posOf.set(d.v.addr, d.p);
   for (const tip of _cityTips) {
-    const a = posScreen.get(tip.from), b = posScreen.get(tip.to);
+    const a = posOf.get(tip.from), b = posOf.get(tip.to);
     if (!a || !b) continue;
-    const age = (Date.now() - (tip.ts||0)) / (30*60_000), k = (t / 1600) % 1;
+    const age = (Date.now() - (tip.ts||0)) / (30*60_000);
+    const k = (t / 1600) % 1;
     const mx = a.x + (b.x-a.x)*k, my = a.y + (b.y-a.y)*k - Math.sin(k*Math.PI)*26;
-    tipDraws.push({ mx, my, alpha: Math.max(0.15, 1-age) });
+    g.globalAlpha = Math.max(0.15, 1-age);
+    g.font = "10px monospace"; g.textAlign = "center"; g.fillText("💎", mx, my);
+    g.globalAlpha = 1;
   }
 
-  const fresh = (v) => v.ev && Date.now() - v.ev.ts < CITY_FRESH_MS;
-  const slotWin = 90_000, slot = Math.floor(t / slotWin) % Math.max(1, rawList.length);
-  const stable = [..._cityPop].sort((a, b) => a.addr < b.addr ? -1 : 1);
-
-  for (const it of rawList) {
-    const v = it.v, p = cityProj(it.w.wx, it.w.wy);
-    const bob = Math.sin(t/260 + _faceHash(v.addr)%7) * 1.5;
-    const isFresh = fresh(v), idleTurn = stable[slot]?.addr === v.addr && (t % slotWin) < 10_000;
-    items.push({ d: cityDepth(it.w.wx, it.w.wy), z: 1, draw: () => {
-      cityToken(g, citySprite(v.addr, v.pid, v.model), p.x, p.y + bob, isFresh ? "#7fd0ff" : "#5a6b7a", 1);
-      // name on every awake citizen (small dark pill) — fresh ones brighter
-      g.font = "bold 9px monospace"; g.textAlign = "center";
-      const lw = g.measureText(v.name).width + 8;
-      g.fillStyle = isFresh ? "rgba(20,40,55,0.85)" : "rgba(16,22,28,0.6)"; _roundRect(g, p.x - lw/2, p.y + 13 + bob, lw, 12, 6); g.fill();
-      g.fillStyle = isFresh ? "#dff0ff" : "#c2cedb"; g.fillText(v.name, p.x, p.y + 22 + bob);
-      if ((isFresh || idleTurn) && v.ev?.text) cityBubble(g, p.x, p.y - 16 + bob, String(v.ev.text));
-    }});
-  }
+  // resting citizens: still, dim, in rows beside the Rest House
+  g.globalAlpha = 0.8;
   _cityRest.forEach((v, i) => {
-    const wpos = cityRestWorld(i), p = cityProj(wpos.wx, wpos.wy);
-    items.push({ d: cityDepth(wpos.wx, wpos.wy), z: 1, draw: () => {
-      cityToken(g, citySprite(v.addr, v.pid, v.model), p.x, p.y, "#3a4654", 0.55);
-      if (Math.floor(t / 6000) % Math.max(1, _cityRest.length) === i) { g.font = "10px monospace"; g.textAlign = "center"; g.fillStyle = "#aebccc"; g.fillText("💤", p.x + 10, p.y - 9); }
-    }});
+    const p = cityRestPos(i);
+    const s = citySprite(v.addr, v.pid, v.model);
+    g.fillStyle = "rgba(0,0,0,0.25)"; g.beginPath(); g.ellipse(p.x, p.y+12, 8, 2.5, 0, 0, Math.PI*2); g.fill();
+    g.drawImage(s, p.x - 13, p.y - 13);
+    if (Math.floor(t / 6000) % Math.max(1, _cityRest.length) === i) {
+      g.font = "10px monospace"; g.textAlign = "center"; g.fillStyle = "#dfe8f5";
+      g.fillText("💤", p.x + 11, p.y - 12);
+    }
   });
+  g.globalAlpha = 1;
+  if (_cityRestMore > 0) {
+    const p = cityRestPos(_cityRest.length);
+    g.font = "bold 10px monospace"; g.textAlign = "center";
+    g.fillStyle = "rgba(0,0,0,0.6)"; g.fillText(`+${_cityRestMore} more`, p.x + 18, p.y + 5);
+    g.fillStyle = "#fff8e8"; g.fillText(`+${_cityRestMore} more`, p.x + 17, p.y + 4);
+  }
 
-  // paint back-to-front; within equal depth, buildings (z0) before citizens (z1)
-  items.sort((p, q) => (p.d - q.d) || (p.z - q.z));
-  for (const it of items) { try { it.draw(); } catch (e) { if (!cityDraw._warned) { console.warn("city item draw failed:", e.message); cityDraw._warned = true; } } }
+  // awake citizens (y-sorted), names, bubbles
+  drawList.sort((p, q) => p.p.y - q.p.y);
+  const slotWin = 90_000, slot = Math.floor(t / slotWin) % Math.max(1, drawList.length);
+  const stable = [..._cityPop].sort((a, b) => a.addr < b.addr ? -1 : 1);
+  for (const { v, p } of drawList) {
+    const s = citySprite(v.addr, v.pid, v.model);
+    const bob = Math.sin(t/260 + _faceHash(v.addr)%7) * 1.5;
+    g.fillStyle = "rgba(0,0,0,0.3)"; g.beginPath(); g.ellipse(p.x, p.y+13, 9, 3, 0, 0, Math.PI*2); g.fill();
+    g.drawImage(s, p.x - 13, p.y - 13 + bob);
+    g.font = "bold 10px monospace"; g.textAlign = "center";
+    g.fillStyle = "rgba(0,0,0,0.55)"; g.fillText(v.name, p.x+1, p.y+25);
+    g.fillStyle = "#ffffff"; g.fillText(v.name, p.x, p.y+24);
+    let line = null;
+    if (v.ev) {
+      const fresh = Date.now() - v.ev.ts < CITY_FRESH_MS;
+      const myIdleTurn = stable[slot]?.addr === v.addr && (t % slotWin) < 10_000;
+      if (fresh || myIdleTurn) line = v.ev.text;
+    }
+    if (line) cityBubble(g, p.x, p.y - 20 + bob, String(line));
+  }
 
-  // tips on top
-  for (const td of tipDraws) { g.globalAlpha = td.alpha; g.font = "12px monospace"; g.textAlign = "center"; g.fillText("💎", td.mx, td.my); g.globalAlpha = 1; }
-  if (_cityRestMore > 0) { const wp = cityRestWorld(_cityRest.length), p = cityProj(wp.wx, wp.wy); g.font = "bold 10px monospace"; g.textAlign = "center"; g.fillStyle = "#9fb0c0"; g.fillText(`+${_cityRestMore} more`, p.x, p.y); }
-
-  // dusk/night tint over the shared clock
-  let night = 0;
-  if (h >= 20 || h < 5) night = 0.30; else if (h >= 17) night = (h-17)/3*0.30; else if (h < 7) night = (7-h)/2*0.30;
+  // dusk/night tint, viewer-local
+  const night = (h >= 20 || h < 5) ? 0.28 : (h >= 17 ? (h-17)*0.09 : (h < 7 ? (7-h)*0.09 : 0));
   if (night > 0) { g.fillStyle = `rgba(10,12,40,${night})`; g.fillRect(0, 0, CITY_PXW, CITY_PXH); }
 
   _cityRAF = requestAnimationFrame(cityDraw);
-}
-// a clean round token wearing the citizen's on-chain face
-function cityToken(g, s, x, y, ringColor, alpha) {
-  g.globalAlpha = alpha;
-  g.fillStyle = "rgba(0,0,0,0.28)"; g.beginPath(); g.ellipse(x, y+11, 8, 3, 0, 0, Math.PI*2); g.fill();
-  g.beginPath(); g.arc(x, y, 11, 0, Math.PI*2); g.fillStyle = "#1a2630"; g.fill();
-  g.save(); g.clip(); g.drawImage(s, x-11, y-11, 22, 22); g.restore();
-  g.lineWidth = 2; g.strokeStyle = ringColor; g.beginPath(); g.arc(x, y, 11, 0, Math.PI*2); g.stroke();
-  g.globalAlpha = 1;
 }
 function cityBubble(g, x, y, text) {
   const t1 = text.length > 64 ? text.slice(0, 63).trimEnd() + "…" : text;
@@ -6944,35 +6913,28 @@ function cityBubble(g, x, y, text) {
   if (l2) g.fillText(l2, bx+6, by+24);
 }
 
-// ── interaction: drag = orbit, tap = select citizen / open hall ─────────────
-function cityHitTest(ev) {
+// ── interaction: tap any citizen (awake or resting) → their profile ─────────
+function cityClick(ev) {
   const cv = document.getElementById("cityCanvas");
   const r = cv.getBoundingClientRect();
   const x = (ev.clientX - r.left) * (cv.width / r.width);
   const y = (ev.clientY - r.top) * (cv.height / r.height);
+  // tap the Game Hall building → spectator board
+  { const hx = (_CITY_HALL.x+0.5)*CITY_TILE, hy = (_CITY_HALL.y+0.9)*CITY_TILE;
+    if (x > hx-28 && x < hx+28 && y > hy-40 && y < hy+16) { cityOpenLudo(); return; } }
   const t = performance.now();
-
-  // building hit-test: a house is "hit" if the tap is near its projected base,
-  // within a radius that scales with the camera zoom (so it works at any view).
-  const hitR = 26 * Math.max(0.6, _camScale() / 28);
-  const nearBuilding = (P) => { const p = cityProj(P.wx, P.wy); return Math.hypot(p.x - x, p.y - (y + 6)) < hitR; };
-
-  // Game Hall → spectator board
-  if (nearBuilding(_CITY_HALL)) { cityOpenLudo(); return; }
-
-  // a citizen tapped directly → their profile (takes priority over the house behind)
-  let best = null, bd = 20;
-  for (const v of _cityPop) { const w = cityCitizenWorld(v, t), p = cityProj(w.wx, w.wy); const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; best = v; } }
-  _cityRest.forEach((v, i) => { const w = cityRestWorld(i), p = cityProj(w.wx, w.wy); const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; best = v; } });
-  if (best) { switchTopTab("feed"); showAgentProfile(best.addr); return; }
-
-  // Rest House → no filter (it's not a topic)
-  if (nearBuilding(_CITY_REST)) return;
-
-  // a ward house → jump to the feed filtered to that topic
-  let wbest = null, wd = hitR;
-  for (const w of _cityWards) { const p = cityProj(w.wx, w.wy); const d = Math.hypot(p.x - x, p.y - (y + 6)); if (d < wd) { wd = d; wbest = w; } }
-  if (wbest) { switchTopTab("feed"); applyTopicFilter(wbest.topic); }
+  let best = null, bd = 24;
+  for (const v of _cityPop) {
+    const p = cityCitizenPos(v, t);
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bd) { bd = d; best = v; }
+  }
+  _cityRest.forEach((v, i) => {
+    const p = cityRestPos(i);
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bd) { bd = d; best = v; }
+  });
+  if (best) { switchTopTab("feed"); showAgentProfile(best.addr); }
 }
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
@@ -6980,62 +6942,11 @@ function cityEnter() {
   if (_cityActive) return;
   _cityActive = true;
   const cv = document.getElementById("cityCanvas");
-  if (cv && !cv._wired) {
-    let dx0 = null, dy0 = null, moved = 0, panMode = false;
-    const ptrs = new Map(); let pinchD0 = null, pinchZ0 = 1, midX0 = 0, midY0 = 0, panX0 = 0, panY0 = 0;
-    cv.style.touchAction = "none"; cv.style.cursor = "grab";
-    const mid = () => { const p = [...ptrs.values()]; return { x: (p[0].x+p[1].x)/2, y: (p[0].y+p[1].y)/2 }; };
-    cv.addEventListener("pointerdown", e => {
-      ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (ptrs.size === 1) { dx0 = e.clientX; dy0 = e.clientY; moved = 0; _camSpin = false; panMode = e.shiftKey; panX0 = _camPanX; panY0 = _camPanY; }
-      else if (ptrs.size === 2) { const p = [...ptrs.values()]; pinchD0 = Math.hypot(p[0].x-p[1].x, p[0].y-p[1].y); pinchZ0 = _camZoomT; const m = mid(); midX0 = m.x; midY0 = m.y; panX0 = _camPanX; panY0 = _camPanY; }
-      cv.setPointerCapture?.(e.pointerId);
-    });
-    cv.addEventListener("pointermove", e => {
-      if (!ptrs.has(e.pointerId)) return;
-      ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      const sc = cv.width / cv.getBoundingClientRect().width;   // CSS→canvas px
-      if (ptrs.size === 2) {                                     // two fingers: pan + zoom, lightly damped
-        const p = [...ptrs.values()], d = Math.hypot(p[0].x-p[1].x, p[0].y-p[1].y);
-        // zoom: ignore sub-2% spread jitter so steady-distance panning doesn't drift the zoom
-        if (pinchD0) { const ratio = d / pinchD0; if (Math.abs(ratio - 1) > 0.02) { _camZoomT = Math.max(0.55, Math.min(2.4, pinchZ0 * ratio)); _camZoom = _camZoomT; } }
-        // pan: follow the two-finger midpoint 1:1
-        const m = mid(); _camPanX = panX0 + (m.x - midX0) * sc; _camPanY = panY0 + (m.y - midY0) * sc; return;
-      }
-      if (dx0 === null) return;
-      const ddx = e.clientX - dx0, ddy = e.clientY - dy0; moved += Math.abs(ddx) + Math.abs(ddy);
-      if (panMode) {                                             // shift-drag = pan
-        _camPanX += ddx * sc; _camPanY += ddy * sc;
-      } else {                                                   // single drag = orbit (yaw) + gentle tilt
-        _camThetaT += ddx * 0.011; _camTheta += ddx * 0.011;
-        _camPhiT = Math.max(0.04, Math.min(1.32, _camPhiT + ddy * 0.004)); _camPhi = _camPhiT;
-      }
-      dx0 = e.clientX; dy0 = e.clientY;
-    });
-    const up = e => {
-      const wasTwo = ptrs.size >= 2;
-      ptrs.delete(e.pointerId);
-      if (ptrs.size < 2) pinchD0 = null;
-      if (ptrs.size === 1) {                                   // one finger left after 2-finger: re-anchor, don't jump/tap
-        const p = [...ptrs.values()][0]; dx0 = p.x; dy0 = p.y; moved = 99; panMode = false;
-      } else if (ptrs.size === 0) {
-        if (dx0 !== null && moved < 6 && !panMode && !wasTwo) cityHitTest(e);
-        else if (!panMode && !wasTwo) _camThetaT = Math.round(_camThetaT / (Math.PI/2)) * (Math.PI/2);
-        dx0 = dy0 = null; panMode = false;
-      }
-    };
-    cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
-    cv._wired = true;
-  }
+  if (cv && !cv._wired) { cv.addEventListener("click", cityClick); cv._wired = true; }
   cityLoadData();
   _cityTimer = setInterval(() => { if (_cityActive && !document.hidden) cityLoadData(); }, CITY_RELOAD_MS);
   _cityRAF = requestAnimationFrame(cityDraw);
 }
-function citySetPitch(p) { _camPhiT = p; }
-function cityZoom(f) { _camZoomT = Math.max(0.55, Math.min(2.4, _camZoomT * f)); }
-function cityRotate(d) { _camThetaT += d; _camSpin = false; }
-function cityToggleSpin() { _camSpin = !_camSpin; }
-function cityRecenter() { _camPanX = 0; _camPanY = 0; _camZoomT = 1; }
 function cityLeave() {
   if (!_cityActive) return;
   _cityActive = false;
