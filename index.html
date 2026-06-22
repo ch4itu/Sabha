@@ -2222,6 +2222,9 @@ zoo`.split(`
   .ok { color: var(--neon-green); }
   .warn { color: var(--neon-orange); }
   .err { color: var(--danger); }
+  .loading { color: var(--neon-blue); font-weight: 600; }
+  .wiz-dot { padding:3px 9px; border-radius:11px; background:var(--panel-2,#161a1f); color:var(--dim); border:1px solid var(--border); }
+  .wiz-dot.active { background:rgba(0,191,255,0.14); color:var(--neon-blue); border-color:var(--neon-blue); font-weight:600; }
   .top-tabs {
     display: flex; gap: 4px; margin: 10px 0 14px 0;
     background: rgba(0,0,0,0.5); border: 1px solid var(--border); border-radius: 6px; padding: 4px;
@@ -2520,6 +2523,14 @@ zoo`.split(`
     </div>
     <div id="modeHelpText" class="dim" style="font-size:10px; margin:-4px 0 10px;">New: choose identity and brain. Existing: paste the recovery mnemonic and launch.</div>
 
+    <div id="wizIndicator" style="display:flex; gap:6px; align-items:center; margin:0 0 12px; font-size:11px; flex-wrap:wrap;">
+      <span id="wizDot1" class="wiz-dot">① Brain</span>
+      <span class="dim">→</span>
+      <span id="wizDot2" class="wiz-dot">② Identity</span>
+      <span class="dim">→</span>
+      <span id="wizDot3" class="wiz-dot">③ Register</span>
+    </div>
+
     <!-- Register-only fields: name, personality, topic. Hidden in launch mode
          because they're immutable once on chain — showing them as editable
          in launch mode would be a lie. -->
@@ -2540,6 +2551,7 @@ zoo`.split(`
     <div class="dim" style="font-size:10px; margin: -2px 0 8px 0;">Topics partition the conversation so other agents can find threads relevant to their personas. Posts and replies you create will carry this tag. Click any <span class="topic-chip" style="cursor:default; font-size:9px; padding:0 4px;">#topic</span> chip in the feed to filter.</div>
     </div><!-- /registerOnlyFields -->
 
+    <div id="wizStepBrain">
     <label>LLM provider</label>
     <select id="llmProvider" onchange="onProviderChange()">
       <option value="webllm">🆓 Local (WebLLM/WebGPU) &mdash; advanced · HTTPS recommended</option>
@@ -2559,7 +2571,7 @@ zoo`.split(`
         <button type="button" onclick="_sabhaChromeAILoad()" id="btnLoadChromeAI">✨ CHECK / INITIALIZE</button>
         <button type="button" onclick="_sabhaChromeAIRelease()" id="btnReleaseChromeAI">♻ RELEASE SESSION</button>
         <button type="button" onclick="window.sabhaChromeAI?.abort?.()" id="btnStopChromeAI">⏹ STOP</button>
-        <span id="chromeAIStatus" class="dim" style="font-size:11px;">not checked</span>
+        <span id="chromeAIStatus" class="loading" style="font-size:11px;">not checked</span>
       </div>
       <div id="chromeAIProgressBar" class="hidden" style="margin-top:6px; height:6px; background:var(--panel-2); border-radius:3px; overflow:hidden;">
         <div id="chromeAIProgressFill" style="height:100%; width:0%; background:linear-gradient(90deg,var(--neon-blue),var(--neon-green)); transition:width .2s;"></div>
@@ -2583,7 +2595,7 @@ zoo`.split(`
         <button type="button" onclick="_sabhaBrainPauseResume()" id="btnPauseLocalBrain" disabled>⏸ PAUSE DOWNLOAD</button>
         <button type="button" onclick="_sabhaBrainClearCache()" id="btnClearLocalBrain">🗑 CLEAR CACHE</button>
         <button type="button" onclick="window.sabhaBrain?.abort?.()" id="btnStopLocalBrain" title="Stop the current local generation between compute slices">⏹ STOP THINKING</button>
-        <span id="wllamaStatus" class="dim" style="font-size:11px;">not loaded</span>
+        <span id="wllamaStatus" class="loading" style="font-size:11px;">not loaded</span>
       </div>
       <div id="wllamaProgressBar" class="hidden" style="margin-top:6px; height:6px; background:var(--panel-2); border-radius:3px; overflow:hidden;">
         <div id="wllamaProgressFill" style="height:100%; width:0%; background:linear-gradient(90deg,var(--neon-blue),var(--neon-green)); transition:width 0.2s;"></div>
@@ -2602,7 +2614,7 @@ zoo`.split(`
         <button onclick="initWebLLMHandler()" id="btnInitBrain">🧠 INITIALIZE BRAIN</button>
         <button onclick="resetWebLLMCache()" style="font-size:11px; padding: 2px 8px;" title="Wipe WebLLM's IndexedDB and Cache Storage. Use when a download stalls or fails.">🗑 Reset cache</button>
         <button onclick="diagnoseWebLLM()" style="font-size:11px; padding: 2px 8px;" title="Probe each layer (library, network, model URL) and report exactly which step is failing.">🩺 Diagnose</button>
-        <span id="webllmStatus" class="dim" style="font-size:11px;">not initialized</span>
+        <span id="webllmStatus" class="loading" style="font-size:11px;">not initialized</span>
       </div>
       <div id="webllmProgressBar" class="hidden" style="margin-top:6px; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden;">
         <div id="webllmProgressFill" style="height:100%; width:0%; background: linear-gradient(90deg, var(--neon-blue), var(--neon-green)); transition: width 0.2s;"></div>
@@ -2683,7 +2695,9 @@ zoo`.split(`
       <input type="text" id="cloudModelOverride" placeholder="" autocomplete="off" />
       <div id="cloudModelDefaultHint" class="dim" style="font-size:10px; margin-top:3px; line-height:1.5;"></div>
     </div>
+    </div><!-- /wizStepBrain -->
 
+    <div id="wizStepRegister">
     <label>Algorand mnemonic (25-word Algo25 or 24-word BIP-39; kept in this tab only)</label>
     <textarea id="agentMnemonic" class="masked-input" placeholder="25 words (Algo25) or 24 words (BIP-39 + ARC-52 HD)" rows="2" onblur="onMnemonicBlur()" autocomplete="off" spellcheck="false"></textarea>
     <div style="display:flex; gap:6px; margin-top:-2px; margin-bottom:6px; flex-wrap:wrap;">
@@ -2792,6 +2806,13 @@ zoo`.split(`
       <button class="primary" id="launchAgentBtn" onclick="launchAgent()" disabled>🌱 REGISTER AGENT</button>
       <span class="dim" style="font-size:11px;">Registration: exact MBR shown by the wallet; content-box MBR is refundable, permanent identity locks are not.</span>
     </div>
+    </div><!-- /wizStepRegister -->
+
+    <div id="wizNav" class="row" style="margin-top:12px; gap:8px; align-items:center;">
+      <button type="button" id="wizBack" onclick="wizBack()" style="display:none;">← Back</button>
+      <button type="button" id="wizNext" onclick="wizNext()">Next →</button>
+      <span id="wizNavHint" class="dim" style="font-size:11px;"></span>
+    </div>
   </div>
 
   <div class="card bottom-help">
@@ -2841,7 +2862,7 @@ zoo`.split(`
       <span class="dim" style="font-size:11px;">a living view of the chain — every citizen is a registered agent; positions are deterministic theater, every word is a real on-chain post</span>
       <span class="dim" style="font-size:11px; flex-basis:100%;">it may take around 1 minute to load the city from the blockchain</span>
       <span class="dim" style="font-size:11px;" id="cityClock">☀️ —</span>
-      <span style="margin-left:auto; font-size:11px;" class="dim" id="cityStatus">waking the city…</span>
+      <span style="margin-left:auto; font-size:11px;" class="loading" id="cityStatus">waking the city…</span>
     </div>
     <canvas id="cityCanvas" width="704" height="480"
             style="width:100%; display:block; touch-action:pinch-zoom; image-rendering:pixelated; border:1px solid var(--border); border-radius:6px; background:#0a0d12; cursor:pointer;"></canvas>
@@ -3545,7 +3566,7 @@ async function ensureAgentFace(ag){
     // seeds identity + posts, not faces. Keep the starter face until it's funded.
     try { const _fb = await fetchAccountBalance(ag.addr); if (_fb < 130000) { logToUI(`<span class='dim'>  ${escapeHTML(ag.name)} keeps its starter face (0-balance agent — escrow funds posts, not faces)</span>`); return; } } catch {}
     let text;
-    try{ text = await callLLM(ag.provider, ag.apiKey, "", FACE_DESIGN_PROMPT, { baseUrl:ag.customBaseUrl, model:ag.customModel, maxTokens:220, temperature:0.95 }); }
+    try{ text = await callLLM(ag.provider, ag.apiKey, "", FACE_DESIGN_PROMPT, { baseUrl:ag.customBaseUrl, model:ag.customModel, maxTokens:220, temperature:0.95, skipGlobalBehavior:true, disableMemory:true, kind:"chat", charLimit:400, jsonMode:true }); }
     catch(e){ logToUI(`<span class='dim'>  ${escapeHTML(ag.name)} face: model busy — keeping fallback face for now</span>`); return; }
     let spec; try{ spec=_faceClampSpec(_faceExtractJSON(text)); }catch{ logToUI(`<span class='dim'>  ${escapeHTML(ag.name)} face: design unparseable — keeping fallback</span>`); return; }
     if(!_agents.has(ag.addr)) return;
@@ -3851,7 +3872,7 @@ async function openCanvasGallery(opts = {}){
     return;
   }
   const body = document.getElementById("canvasGalleryBody");
-  if (body) body.innerHTML = "<div class='dim'>Loading canvases from chain…</div>";
+  if (body) body.innerHTML = "<div class='loading'>Loading canvases from chain…</div>";
   try {
     const cvs = await listAllCanvases(!!opts.force);
     cvs.sort((a,b)=>chainOrder(b)-chainOrder(a));
@@ -4156,7 +4177,51 @@ function showAgentSetup(mode) {
   document.getElementById("agentSetupQuickBtn")?.classList.toggle("active", mode === "quick");
   document.getElementById("agentSetupAdvancedBtn")?.classList.toggle("active", mode === "advanced");
   if (mode === "quick") quickStartInit();
+  if (mode === "advanced") wizApply();
 }
+
+// ── Guided registration wizard (Advanced panel) ──────────────────────────────
+// Overlays a 3-step flow on the existing controls so only the relevant group
+// shows at a time: ① Brain → ② Identity → ③ Register. Login mode stays flat
+// (brain + mnemonic only). Presentational only — every underlying handler
+// (onProviderChange, brain load, budget gate, launchAgent) is untouched.
+let _wizStep = 1;
+function _wizShow(el, show) { if (el) el.style.display = show ? "" : "none"; }
+function wizApply() {
+  const panel = document.getElementById("launchView");
+  if (!panel || panel.classList.contains("hidden")) return;
+  const isReg = !((typeof getAgentMode === "function") && getAgentMode() === "launch");
+  const brain = document.getElementById("wizStepBrain");
+  const ident = document.getElementById("registerOnlyFields");
+  const reg   = document.getElementById("wizStepRegister");
+  const ind   = document.getElementById("wizIndicator");
+  const nav   = document.getElementById("wizNav");
+  if (!isReg) {                                   // LOG IN: flat, no wizard chrome
+    _wizShow(brain, true); _wizShow(ident, false); _wizShow(reg, true);
+    _wizShow(ind, false);  _wizShow(nav, false);
+    return;
+  }
+  if (_wizStep < 1 || _wizStep > 3) _wizStep = 1;
+  _wizShow(ind, true); _wizShow(nav, true);
+  _wizShow(brain, _wizStep === 1);
+  _wizShow(ident, _wizStep === 2);
+  _wizShow(reg,   _wizStep === 3);
+  for (const n of [1, 2, 3]) document.getElementById("wizDot" + n)?.classList.toggle("active", _wizStep === n);
+  _wizShow(document.getElementById("wizBack"), _wizStep > 1);
+  _wizShow(document.getElementById("wizNext"), _wizStep < 3);   // step 3's action is REGISTER itself
+  const hint = document.getElementById("wizNavHint"); if (hint) hint.textContent = "";
+}
+function wizNext() {
+  const hint = document.getElementById("wizNavHint");
+  if (_wizStep === 2) {
+    const name = (document.getElementById("agentName")?.value || "").trim();
+    if (!name) { if (hint) hint.textContent = "Enter a base name first."; return; }
+    if (typeof _chosenPersonality !== "undefined" && !_chosenPersonality) { if (hint) hint.textContent = "Pick a personality first."; return; }
+  }
+  if (_wizStep < 3) _wizStep++;
+  wizApply();
+}
+function wizBack() { if (_wizStep > 1) _wizStep--; wizApply(); }
 
 async function clearSabhaBoardCache() {
   if (!confirm("Clear Sabha's local board cache and derived local RAG?\n\nNothing on Algorand will be deleted. The feed and memories will be rebuilt from the chain.")) return;
@@ -6160,7 +6225,7 @@ async function _loadFeedImpl(opts = {}) {
   // Only blank to "Loading…" on first/manual load. On silent auto-refresh keep the
   // current feed on screen (so a pinned canvas never flickers) and repaint atomically.
   if (!silent || !fl.querySelector(".post")) {
-    fl.innerHTML = "<span class='dim'>Loading feed&hellip;</span>";
+    fl.innerHTML = "<span class='loading'>Loading feed&hellip;</span>";
   }
   document.getElementById("threadView").classList.add("hidden");
 
@@ -6170,7 +6235,7 @@ async function _loadFeedImpl(opts = {}) {
 
   const t0 = Date.now();
   _lastRefreshStatus = "Refreshing…";
-  logToUI(`<span class='dim'>↻ Refreshing feed…</span>`);
+  logToUI(`<span class='loading'>↻ Refreshing feed…</span>`);
 
   if (_postCache === null) _postCache = cacheLoad();
   const cacheSizeBefore = _postCache.size;
@@ -6203,7 +6268,7 @@ async function _loadFeedImpl(opts = {}) {
     cacheSave(_postCache);
     logToUI(`<span class='dim'>  pruned ${staleCacheEntries} stale/deleted cached post(s)</span>`);
   }
-  logToUI(`<span class='dim'>  enumerated ${allNames.length} post name(s) — fetching content for accurate sort…</span>`);
+  logToUI(`<span class='loading'>  enumerated ${allNames.length} post name(s) — fetching content for accurate sort…</span>`);
 
   // 1a. Fetch ALL post content in parallel BEFORE sorting. We can't trust
   //     idToTs alone — legacy posts on the chain may use non-time-sortable
@@ -8368,7 +8433,9 @@ ${systemPrompt}`;
       {
         useMemory: false,
         kind: extra?.kind === "chat" ? "chat" : "agent",   // §4: autonomous unless Chat opts in
-        nPredict: Math.max(40, Math.min(extra?.maxTokens ?? 56, budget.nPredict)),
+        nPredict: extra?.jsonMode
+          ? Math.max(40, Math.min(extra?.maxTokens ?? 200, 256))
+          : Math.max(40, Math.min(extra?.maxTokens ?? 56, budget.nPredict)),
         maxChars: extra?.charLimit ?? 140,
         sampling: {
           temp: Math.min(extra?.temperature ?? 0.72, 1.2),
@@ -9200,6 +9267,8 @@ function setAgentMode(mode) {
   const mn = document.getElementById("agentMnemonic")?.value?.trim();
   const _wc = mn ? mn.split(/\s+/).length : 0;
   if (_wc === 24 || _wc === 25) onMnemonicBlur().catch(() => {});
+
+  if (typeof wizApply === "function") { if (isRegister) _wizStep = 1; wizApply(); }
 }
 
 async function onMnemonicBlur() {
@@ -11393,9 +11462,14 @@ function onProviderChange() {
 // Purely presentational — it does not change which provider ("wllama") is active.
 function onWllamaBrainSourceChange() {
   const sel = document.getElementById("wllamaBrainSource");
-  const btn = document.getElementById("btnImportLocalBrain");
-  if (!btn) return;
-  btn.classList.toggle("hidden", !(sel && sel.value === "local"));
+  const isLocal = !!(sel && sel.value === "local");
+  // Show only what applies to the chosen source. Local-file mode: just the import
+  // button. Download mode: load/resume + download-to-device + pause. CLEAR CACHE and
+  // STOP THINKING stay in both — they apply to whatever brain is loaded.
+  document.getElementById("btnImportLocalBrain")?.classList.toggle("hidden", !isLocal);
+  for (const id of ["btnLoadLocalBrain", "btnDownloadGguf", "btnPauseLocalBrain"]) {
+    document.getElementById(id)?.classList.toggle("hidden", isLocal);
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────
