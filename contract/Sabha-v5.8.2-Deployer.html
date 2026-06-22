@@ -1,0 +1,5743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sabha — hardened fresh deploy (v5.8.2)</title>
+<script src="https://cdn.jsdelivr.net/npm/algosdk@2.9.0/dist/browser/algosdk.min.js"></script>
+<style>
+  :root{color-scheme:dark}
+  body{font:14px/1.55 ui-monospace,Menlo,Consolas,monospace;max-width:880px;margin:24px auto;padding:0 16px;background:#0b0e13;color:#cdd6e4}
+  h1{font-size:18px;margin:0 0 6px} h2{font-size:14px;margin:20px 0 6px;color:#7fd1ff}
+  label{display:block;margin:10px 0 3px;color:#9fb0c8}
+  textarea,input{width:100%;box-sizing:border-box;background:#11151d;color:#cdd6e4;border:1px solid #243049;border-radius:6px;padding:8px;font:inherit}
+  textarea{min-height:70px;resize:vertical}
+  .row{display:flex;gap:10px;flex-wrap:wrap}.row>div{flex:1;min-width:120px}
+  button{margin-top:14px;background:#1b6fff;color:#fff;border:0;border-radius:6px;padding:10px 18px;font:inherit;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .hint{color:#7d8aa3;font-size:12px;margin:4px 0}
+  .out{white-space:pre-wrap;word-break:break-all;background:#11151d;border:1px solid #243049;border-radius:6px;padding:10px;margin-top:14px;min-height:40px}
+  .out .ok{color:#5fd38a}.out .er{color:#ff6b6b}.out .step{color:#7fd1ff}
+  code{color:#ffd479}
+  summary{cursor:pointer}
+</style>
+</head>
+<body>
+<h1>Sabha — hardened fresh deploy v5.8.2</h1>
+<p class="hint">Turnkey <b>TestNet-only</b> deployer for the security-hardened v5.8.2 contract. It creates the app, funds the app account, compiles and funds the restricted sponsor LogicSig, then links it as the final step. <b>Linking permanently disables contract upgrades.</b> Progress is saved locally after every confirmed transaction, so reopening this file resumes instead of creating a duplicate app.</p>
+<p class="hint" style="border:1px solid #8a5a18;border-radius:6px;padding:8px"><b>Wallet safety:</b> use a fresh disposable TestNet deployment account containing only the required amount. This file loads the pinned Algorand SDK from a public CDN; never paste a valuable MainNet mnemonic.</p>
+
+<h2>1. Deployer mnemonic (25 words)</h2>
+<textarea id="mn" placeholder="word1 word2 ... word25" autocomplete="off" spellcheck="false"></textarea>
+<p class="hint">Stays in this page. Used only to sign locally; sent to no one except the algod node below.</p>
+
+<h2>2. Sponsor pool + node</h2>
+<div class="row">
+  <div><label>Sponsor spendable pool (ALGO)</label><input type="number" id="pool" value="1" min="0" max="20" step="0.1"></div>
+  <div><label>algod endpoint</label><input type="text" id="algod" value="https://testnet-api.algonode.cloud"></div>
+</div>
+<p class="hint">The deployer additionally preserves the escrow account minimum balance. Sponsorship is globally capped, identity-gated, exact-MBR-only and but it is still a finite public subsidy—fund only what you are prepared to spend.</p>
+
+<p class="hint" style="border:1px solid #243049;border-radius:6px;padding:8px;margin-top:14px"><b>v5.8.2 contract interface:</b> schema <b>1 global uint / 1 global byte-slice</b>. Sponsor LogicSig allows only <code>sponsored_register_agent(string,string)</code> (<code>0x9a06e2a2</code>) and <code>sponsored_post(string,string)</code> (<code>0xb155ccca</code>), each capped at <b>0.35 ALGO MBR</b>; the contract enforces exact MBR. The payment may carry up to <b>0.015 ALGO</b> of pooled network-fee credit for PuyaPy OpUp inner calls. The final <code>set_escrow</code> call disables upgrades, while creator moderation of only <code>e:</code>/<code>s:</code>/<code>p:</code> remains available with full MBR refunded and no access to <code>i:</code>/<code>n:</code>/<code>a:</code>.</p>
+<details><summary class="hint">View embedded sponsor escrow LogicSig</summary><pre class="out" id="escrowView" style="max-height:260px;overflow:auto"></pre></details>
+
+<h2>3. Real PuyaPy compiler output</h2>
+<p class="hint" style="border:1px solid #1f7a3f;border-radius:6px;padding:8px;color:#7ee0a0"><b>✓ Ready to deploy — no compile or paste needed.</b> The compiled <code>v5.8.2</code> approval and clear-state TEAL are embedded in this file and pre-filled into the fields below (they assemble to a verified 5,835-byte approval program plus 4-byte clear program (5,839 bytes total)). The fields are editable only if you ever want to override; leave them as-is to use the embedded TEAL.</p>
+<label>Approval TEAL <span style="color:#7ee0a0">(embedded &amp; pre-filled)</span></label>
+<textarea id="approvalTealInput" style="min-height:150px" placeholder="Paste the exact PuyaPy-generated approval TEAL"></textarea>
+<label>Clear-state TEAL <span style="color:#7ee0a0">(embedded &amp; pre-filled)</span></label>
+<textarea id="clearTealInput" style="min-height:90px" placeholder="Paste the exact PuyaPy-generated clear-state TEAL"></textarea>
+
+<div class="row"><button id="go" onclick="deploy()">Deploy / Resume on TestNet</button><button type="button" onclick="resetSavedDeployment()" style="background:#3a2430">Reset saved progress</button></div>
+
+<h2>Result — paste into index.html</h2>
+<pre class="out" id="cfg">// APP_ID / ESCROW_ADDRESS / ESCROW_PROGRAM_B64 appear here after a successful deploy</pre>
+<div class="out" id="out"></div>
+
+<script type="application/teal" id="approvalTeal">#pragma version 11
+#pragma typetrack false
+
+// algopy.arc4.ARC4Contract.approval_program() -> uint64:
+main:
+    intcblock 0 1 32 64 400 2500 256 4096 86400 131072 65536 7000
+    bytecblock 0x657363726f77 0x151f7c75 "" 0x73706f6e5f7374617465 0x703a 0x653a 0x00 0x733a 0x693a 0x7265675f7374617465 0x743a 0x6e3a 0x7469703a 0x736565643a 0x613a 0x068101 0x73706f6e5f646179 0x73706f6e5f746f646179 0x61646d696e
+    txn ApplicationID
+    bnz main_after_if_else@2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:71-73
+    // # Kept under the existing key for upgrade compatibility. The decoder in
+    // # each method also accepts the previous day*64+sponsored_count format.
+    // self.spon_state = UInt64(0)
+    bytec_3 // "spon_state"
+    intc_0 // 0
+    app_global_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:75-77
+    // # Set once immediately after creation. Sponsored-box refunds and released
+    // # legacy quota MBR can be recycled back to this fixed pool.
+    // self.escrow = Global.zero_address.bytes
+    bytec_0 // "escrow"
+    global ZeroAddress
+    app_global_put
+
+main_after_if_else@2:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:69
+    // class UniversalStateMachine(ARC4Contract):
+    txn NumAppArgs
+    bz main_bare_routing@34
+    txn OnCompletion
+    !
+    assert
+    txn ApplicationID
+    assert
+    pushbytess 0x132ceafa 0x651873f6 0xf7359e32 0x5dcd81f1 0xb29425b3 0xab551cb9 0x64e02612 0xb155ccca 0x9948fe7a 0x35f8a2ad 0xf2fca3c9 0x8c039297 0x9a06e2a2 0xab127e02 0xdf3bf19d 0xa9804912 0xcfa35377 0x7db3300f 0x4df1f190 0x1ed0bb26 0xae37d94a 0x1c082dca 0xa1e08c2a 0x718a4651 0x562d257b // method "set_escrow(address)void", method "migrate_legacy(address)void", method "save_entity(string,string)string", method "load_entity(string)string", method "delete_entity(string)void", method "record_tip(string,address,uint64,string)string", method "delete_tip(string)void", method "sponsored_post(string,string)string", method "delete_sponsored(string)void", method "sponsored_remaining(address)(uint64,uint64,uint64)", method "recycle_surplus()void", method "register_agent(string,string)string", method "sponsored_register_agent(string,string)string", method "agent_name_available(string)bool", method "delete_agent()void", method "reg_remaining()uint64", method "start_process(string,address,string,uint64)string", method "update_process(string,string)string", method "resign_process(string)void", method "load_process(string)string", method "get_process_info(string)(address,address,uint64,bool,uint64)", method "delete_process(string)void", method "admin_delete_entity(string)void", method "admin_delete_process(string)void", method "admin_delete_sponsored(string)void"
+    txna ApplicationArgs 0
+    match set_escrow migrate_legacy save_entity load_entity delete_entity record_tip delete_tip sponsored_post delete_sponsored sponsored_remaining recycle_surplus register_agent sponsored_register_agent agent_name_available delete_agent reg_remaining start_process update_process resign_process load_process get_process_info delete_process admin_delete_entity admin_delete_process admin_delete_sponsored
+    err
+
+main_bare_routing@34:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:69
+    // class UniversalStateMachine(ARC4Contract):
+    intc_0 // NoOp
+    pushint 4 // UpdateApplication
+    txn OnCompletion
+    match main___algopy_default_create@35 main_update_application@36
+    err
+
+main_update_application@36:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:79-80
+    // # ============ ADMIN / UPGRADE ============
+    // @arc4.baremethod(allow_actions=["UpdateApplication"])
+    txn ApplicationID
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:82
+    // assert Txn.sender == Global.creator_address, "Only creator can update"
+    txn Sender
+    global CreatorAddress
+    ==
+    assert // Only creator can update
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:83-85
+    // # Linking the sponsor escrow is the one-way finalization switch. After
+    // # set_escrow, no account—including the creator—can replace this logic.
+    // assert self.escrow == Global.zero_address.bytes, "Application is permanently finalized"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    global ZeroAddress
+    ==
+    assert // Application is permanently finalized
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:79-80
+    // # ============ ADMIN / UPGRADE ============
+    // @arc4.baremethod(allow_actions=["UpdateApplication"])
+    intc_1 // 1
+    return
+
+main___algopy_default_create@35:
+    txn ApplicationID
+    !
+    return
+
+
+// _puya_lib.util.ensure_budget(required_budget: uint64, fee_source: uint64) -> void:
+ensure_budget:
+    proto 2 0
+    frame_dig -2
+    pushint 10
+    +
+
+ensure_budget_while_top@1:
+    frame_dig 0
+    global OpcodeBudget
+    >
+    bz ensure_budget_after_while@6
+    itxn_begin
+    pushint 6 // appl
+    itxn_field TypeEnum
+    pushint 5 // DeleteApplication
+    itxn_field OnCompletion
+    bytec 15 // 0x068101
+    itxn_field ApprovalProgram
+    bytec 15 // 0x068101
+    itxn_field ClearStateProgram
+    frame_dig -1
+    switch ensure_budget_switch_case_0@3 ensure_budget_switch_case_1@4
+
+ensure_budget_switch_case_next@5:
+    itxn_submit
+    b ensure_budget_while_top@1
+
+ensure_budget_switch_case_1@4:
+    global MinTxnFee
+    itxn_field Fee
+    b ensure_budget_switch_case_next@5
+
+ensure_budget_switch_case_0@3:
+    intc_0 // 0
+    itxn_field Fee
+    b ensure_budget_switch_case_next@5
+
+ensure_budget_after_while@6:
+    retsub
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.set_escrow[routing]() -> void:
+set_escrow:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:87
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // invalid number of bytes for arc4.static_array<arc4.uint8, 32>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:89
+    // assert Txn.sender == Global.creator_address, "Only creator can set escrow"
+    txn Sender
+    global CreatorAddress
+    ==
+    assert // Only creator can set escrow
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:90
+    // assert self.escrow == Global.zero_address.bytes, "Escrow already set"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    global ZeroAddress
+    ==
+    assert // Escrow already set
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:91
+    // assert escrow.native != Global.zero_address, "Invalid escrow"
+    dup
+    global ZeroAddress
+    !=
+    assert // Invalid escrow
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:92
+    // self.escrow = escrow.native.bytes
+    bytec_0 // "escrow"
+    swap
+    app_global_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:87
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.migrate_legacy[routing]() -> void:
+migrate_legacy:
+    bytec_2 // ""
+    dupn 4
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:94
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    len
+    intc_2 // 32
+    ==
+    assert // invalid number of bytes for arc4.static_array<arc4.uint8, 32>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:96-100
+    // # Run once immediately after updating the original contract whose global
+    // # keys were: admin(bytes), spon_day(uint), spon_today(uint). Global schema
+    // # cannot be enlarged during an app update, so delete those keys first and
+    // # reuse their existing slots for escrow(bytes) and spon_state(uint).
+    // assert Txn.sender == Global.creator_address, "Only creator can migrate"
+    txn Sender
+    global CreatorAddress
+    ==
+    assert // Only creator can migrate
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:101
+    // assert escrow.native != Global.zero_address, "Invalid escrow"
+    global ZeroAddress
+    !=
+    assert // Invalid escrow
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:103
+    // existing_state, new_state_exists = op.AppGlobal.get_ex_uint64(0, b"spon_state")
+    intc_0 // 0
+    bytec_3 // 0x73706f6e5f7374617465
+    app_global_get_ex
+    bury 1
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:104
+    // existing_escrow, new_escrow_exists = op.AppGlobal.get_ex_bytes(0, b"escrow")
+    intc_0 // 0
+    bytec_0 // 0x657363726f77
+    app_global_get_ex
+    cover 2
+    pop
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:105
+    // assert not new_state_exists and not new_escrow_exists, "Migration already completed"
+    bnz migrate_legacy_bool_false@4
+    dup
+    bnz migrate_legacy_bool_false@4
+    intc_1 // 1
+
+migrate_legacy_bool_merge@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:105
+    // assert not new_state_exists and not new_escrow_exists, "Migration already completed"
+    assert // Migration already completed
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:107
+    // old_day, old_day_exists = op.AppGlobal.get_ex_uint64(0, b"spon_day")
+    intc_0 // 0
+    bytec 16 // 0x73706f6e5f646179
+    app_global_get_ex
+    swap
+    bury 7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:108
+    // old_used, old_used_exists = op.AppGlobal.get_ex_uint64(0, b"spon_today")
+    intc_0 // 0
+    bytec 17 // 0x73706f6e5f746f646179
+    app_global_get_ex
+    bury 6
+    bury 6
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:109
+    // old_admin, old_admin_exists = op.AppGlobal.get_ex_bytes(0, b"admin")
+    intc_0 // 0
+    bytec 18 // 0x61646d696e
+    app_global_get_ex
+    bury 9
+    pop
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:110
+    // assert old_day_exists and old_used_exists and old_admin_exists, "Legacy state not found"
+    bz migrate_legacy_bool_false@9
+    dig 3
+    bz migrate_legacy_bool_false@9
+    dig 6
+    bz migrate_legacy_bool_false@9
+    intc_1 // 1
+
+migrate_legacy_bool_merge@10:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:110
+    // assert old_day_exists and old_used_exists and old_admin_exists, "Legacy state not found"
+    assert // Legacy state not found
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:112
+    // today = Global.latest_timestamp // DAY_SECONDS
+    global LatestTimestamp
+    intc 8 // 86400
+    /
+    dup
+    bury 4
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:113
+    // sponsored_used = old_used if old_day == today and old_used <= GLOBAL_SPONSORED_CAP else UInt64(0)
+    dig 6
+    ==
+    bz migrate_legacy_bool_false@13
+    dig 4
+    pushint 20
+    <=
+    bz migrate_legacy_bool_false@13
+    intc_1 // 1
+
+migrate_legacy_bool_merge@14:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:113
+    // sponsored_used = old_used if old_day == today and old_used <= GLOBAL_SPONSORED_CAP else UInt64(0)
+    intc_0 // 0
+    dig 6
+    uncover 2
+    select
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:115
+    // op.AppGlobal.delete(b"admin")
+    bytec 18 // 0x61646d696e
+    app_global_del
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:116
+    // op.AppGlobal.delete(b"spon_day")
+    bytec 16 // 0x73706f6e5f646179
+    app_global_del
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:117
+    // op.AppGlobal.delete(b"spon_today")
+    bytec 17 // 0x73706f6e5f746f646179
+    app_global_del
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:118
+    // op.AppGlobal.put(b"spon_state", (today * GLOBAL_DAY_RADIX) + (sponsored_used * GLOBAL_COUNTER_RADIX))
+    dig 3
+    intc 7 // 4096
+    *
+    swap
+    intc_3 // 64
+    *
+    +
+    bytec_3 // 0x73706f6e5f7374617465
+    swap
+    app_global_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:119
+    // op.AppGlobal.put(b"escrow", escrow.native.bytes)
+    bytec_0 // 0x657363726f77
+    dig 2
+    app_global_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:94
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+migrate_legacy_bool_false@13:
+    intc_0 // 0
+    b migrate_legacy_bool_merge@14
+
+migrate_legacy_bool_false@9:
+    intc_0 // 0
+    b migrate_legacy_bool_merge@10
+
+migrate_legacy_bool_false@4:
+    intc_0 // 0
+    b migrate_legacy_bool_merge@5
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.save_entity[routing]() -> void:
+save_entity:
+    intc_0 // 0
+    dup
+    bytec_2 // ""
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:186-187
+    // # ============ ENTITIES ============
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:189
+    // entity_id_bytes = entity_id.native.bytes
+    swap
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:190
+    // entity_data_bytes = entity_data.native.bytes
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:191
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    dup
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:192
+    // assert entity_id_bytes.length <= 62, "Entity ID too long (max 62 bytes)"
+    dup
+    pushint 62
+    <=
+    assert // Entity ID too long (max 62 bytes)
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:193
+    // assert entity_data_bytes.length <= MAX_ENTITY_DATA, "Entity data exceeds safe 976-byte limit"
+    uncover 2
+    len
+    pushint 976
+    <=
+    assert // Entity data exceeds safe 976-byte limit
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:194
+    // assert entity_id_bytes[:4] != b"tip:", "Tip IDs must use record_tip"
+    pushint 4
+    dig 1
+    >=
+    pushint 4
+    cover 2
+    select
+    dig 1
+    intc_0 // 0
+    uncover 2
+    substring3
+    bytec 12 // 0x7469703a
+    !=
+    assert // Tip IDs must use record_tip
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:196
+    // box_key = b"e:" + entity_id_bytes
+    bytec 5 // 0x653a
+    swap
+    concat
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:198
+    // old_value, exists = box.maybe()
+    box_get
+    swap
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:200
+    // if exists:
+    bz save_entity_else_body@8
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:201
+    // assert old_value.length >= ENTITY_HEADER_BYTES, "Corrupted entity box"
+    dig 1
+    dup
+    len
+    dup
+    bury 8
+    dup
+    pushint 48
+    >=
+    assert // Corrupted entity box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:202
+    // owner = Account(old_value[:32])
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    dup
+    bury 12
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:203
+    // assert Txn.sender == owner, "Only owner can update entity"
+    txn Sender
+    ==
+    assert // Only owner can update entity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:204
+    // created_timestamp = old_value[32:40]
+    pushint 40
+    dig 2
+    >=
+    pushint 40
+    dig 3
+    uncover 2
+    select
+    uncover 3
+    cover 2
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:205
+    // new_content = Txn.sender.bytes + created_timestamp + op.itob(Global.latest_timestamp) + entity_data_bytes
+    txn Sender
+    swap
+    concat
+    global LatestTimestamp
+    itob
+    concat
+    uncover 2
+    concat
+    dup
+    bury 10
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:207
+    // new_size = new_content.length
+    len
+    dup
+    bury 8
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:208
+    // if new_size > old_size:
+    <
+    bz save_entity_else_body@4
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:209
+    // self._verify_mbr_payment(BOX_BYTE_MBR * (new_size - old_size))
+    dig 5
+    dup
+    dig 6
+    -
+    intc 4 // 400
+    *
+    callsub _verify_mbr_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:210
+    // box.resize(new_size)
+    dig 2
+    swap
+    box_resize
+
+save_entity_after_if_else@7:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:215
+    // box.put(new_content)
+    dig 1
+    dig 8
+    box_put
+
+save_entity_after_if_else@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:186-187
+    // # ============ ENTITIES ============
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 4
+    concat
+    log
+    intc_1 // 1
+    return
+
+save_entity_else_body@4:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:211
+    // elif new_size < old_size:
+    dig 5
+    dig 5
+    <
+    bz save_entity_after_if_else@7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:212
+    // released = BOX_BYTE_MBR * (old_size - new_size)
+    dig 4
+    dig 6
+    dup
+    cover 2
+    -
+    intc 4 // 400
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:213
+    // box.resize(new_size)
+    dig 3
+    uncover 2
+    box_resize
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:214
+    // self._pay(owner, released)
+    dig 7
+    swap
+    callsub _pay
+    b save_entity_after_if_else@7
+
+save_entity_else_body@8:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:217-219
+    // # A logical entity ID may exist in exactly one namespace. This stops
+    // # e:/s: shadowing attacks in clients that discover both namespaces.
+    // assert not BoxRef(key=b"s:" + entity_id_bytes), "Entity ID already exists in sponsored namespace"
+    bytec 7 // 0x733a
+    dig 4
+    dup
+    cover 2
+    concat
+    box_len
+    bury 1
+    !
+    assert // Entity ID already exists in sponsored namespace
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:220
+    // assert not BoxRef(key=b"t:" + entity_id_bytes), "Entity ID already exists in tip namespace"
+    bytec 10 // 0x743a
+    swap
+    concat
+    box_len
+    bury 1
+    !
+    assert // Entity ID already exists in tip namespace
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:222
+    // Txn.sender.bytes
+    txn Sender
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:223
+    // + op.itob(Global.latest_timestamp)
+    global LatestTimestamp
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:222-223
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:224
+    // + op.itob(Global.latest_timestamp)
+    global LatestTimestamp
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:222-224
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:222-225
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    // + entity_data_bytes
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:227
+    // total_size = box_key.length + new_content.length
+    dig 2
+    dup
+    cover 2
+    len
+    dig 1
+    len
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:228
+    // self._verify_mbr_payment(BOX_FLAT_MBR + (BOX_BYTE_MBR * total_size))
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    callsub _verify_mbr_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:229
+    // box.put(new_content)
+    box_put
+    b save_entity_after_if_else@9
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.load_entity[routing]() -> void:
+load_entity:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:233
+    // @arc4.abimethod(readonly=True)
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:235
+    // entity_id_bytes = entity_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:236
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:237
+    // box = BoxRef(key=b"e:" + entity_id_bytes)
+    bytec 5 // 0x653a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:238
+    // value, exists = box.maybe()
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:239
+    // assert exists, "Entity does not exist"
+    assert // Entity does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:240
+    // assert value.length >= ENTITY_HEADER_BYTES, "Corrupted entity box"
+    dup
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted entity box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:241
+    // assert value.length <= ENTITY_HEADER_BYTES + MAX_ENTITY_DATA, "Entity is too large for ARC-4 return"
+    dup
+    pushint 1024
+    <=
+    assert // Entity is too large for ARC-4 return
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:242
+    // return arc4.String.from_bytes(value[ENTITY_HEADER_BYTES:])
+    pushint 48
+    dig 1
+    >=
+    pushint 48
+    dig 2
+    uncover 2
+    select
+    swap
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:233
+    // @arc4.abimethod(readonly=True)
+    bytec_1 // 0x151f7c75
+    swap
+    concat
+    log
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.delete_entity[routing]() -> void:
+delete_entity:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:244
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:246
+    // entity_id_bytes = entity_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:247
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:248
+    // box_key = b"e:" + entity_id_bytes
+    bytec 5 // 0x653a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:250
+    // value, exists = box.maybe()
+    dup
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:251
+    // assert exists, "Entity does not exist"
+    assert // Entity does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:252
+    // assert value.length >= ENTITY_HEADER_BYTES, "Corrupted entity box"
+    dup
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted entity box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:253
+    // owner = Account(value[:32])
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    uncover 2
+    intc_0 // 0
+    uncover 2
+    substring3
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:254
+    // assert Txn.sender == owner, "Only owner can delete entity"
+    txn Sender
+    dig 1
+    ==
+    assert // Only owner can delete entity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:255
+    // total_size = box_key.length + value.length
+    dig 2
+    len
+    uncover 2
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:256
+    // assert box.delete()
+    uncover 2
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:244
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.record_tip[routing]() -> void:
+record_tip:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:259-260
+    // # ============ VERIFIED TIPS ============
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    cover 2
+    len
+    intc_2 // 32
+    ==
+    assert // invalid number of bytes for arc4.static_array<arc4.uint8, 32>
+    txna ApplicationArgs 3
+    dup
+    len
+    pushint 8
+    ==
+    assert // invalid number of bytes for arc4.uint64
+    txna ApplicationArgs 4
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:268
+    // entity_id_bytes = entity_id.native.bytes
+    uncover 2
+    extract 2 0
+    dup
+    cover 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:269
+    // data = tip_data.native.bytes
+    swap
+    extract 2 0
+    dup
+    cover 2
+    cover 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:270
+    // assert entity_id_bytes.length >= 5, "Tip ID cannot be empty"
+    dup
+    len
+    dup
+    pushint 5
+    >=
+    assert // Tip ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:271
+    // assert entity_id_bytes.length <= 62, "Tip ID too long"
+    dup
+    pushint 62
+    <=
+    assert // Tip ID too long
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:272
+    // assert entity_id_bytes[:4] == b"tip:", "Tip ID must begin with tip:"
+    pushint 4
+    dig 1
+    >=
+    pushint 4
+    cover 2
+    select
+    intc_0 // 0
+    swap
+    substring3
+    bytec 12 // 0x7469703a
+    ==
+    assert // Tip ID must begin with tip:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:273
+    // assert data.length <= MAX_TIP_DATA, "Tip data too large"
+    len
+    pushint 512
+    <=
+    assert // Tip data too large
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:274
+    // assert amount.native > 0 and amount.native <= MAX_TIP_AMOUNT, "Tip amount outside allowed range"
+    btoi
+    dup
+    bz record_tip_bool_false@4
+    dup
+    pushint 100000
+    <=
+    bz record_tip_bool_false@4
+    intc_1 // 1
+
+record_tip_bool_merge@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:274
+    // assert amount.native > 0 and amount.native <= MAX_TIP_AMOUNT, "Tip amount outside allowed range"
+    assert // Tip amount outside allowed range
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:275
+    // assert recipient.native != Global.zero_address, "Tip recipient cannot be zero address"
+    global ZeroAddress
+    dig 4
+    dup
+    uncover 2
+    !=
+    assert // Tip recipient cannot be zero address
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:276
+    // assert recipient.native != Txn.sender, "An agent cannot tip itself"
+    dup
+    txn Sender
+    !=
+    assert // An agent cannot tip itself
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:277
+    // assert BoxRef(key=b"i:" + Txn.sender.bytes), "Tipping requires a registered agent identity"
+    bytec 8 // 0x693a
+    txn Sender
+    concat
+    box_len
+    bury 1
+    assert // Tipping requires a registered agent identity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:279
+    // assert Txn.group_index > 1, "Tip payment and MBR payment are required"
+    txn GroupIndex
+    intc_1 // 1
+    >
+    assert // Tip payment and MBR payment are required
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:280
+    // value_payment = gtxn.PaymentTransaction(Txn.group_index - 2)
+    txn GroupIndex
+    pushint 2
+    -
+    dup
+    gtxns TypeEnum
+    intc_1 // pay
+    ==
+    assert // transaction type is pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:281
+    // assert value_payment.sender == Txn.sender, "Tip payment must come from caller"
+    dup
+    gtxns Sender
+    txn Sender
+    ==
+    assert // Tip payment must come from caller
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:282
+    // assert value_payment.receiver == recipient.native, "Tip payment recipient mismatch"
+    dup
+    gtxns Receiver
+    dig 2
+    ==
+    assert // Tip payment recipient mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:283
+    // assert value_payment.amount == amount.native, "Tip payment amount mismatch"
+    dup
+    gtxns Amount
+    dig 3
+    dup
+    cover 3
+    ==
+    assert // Tip payment amount mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:284
+    // assert value_payment.rekey_to == Global.zero_address, "Tip payment cannot rekey"
+    dup
+    gtxns RekeyTo
+    global ZeroAddress
+    ==
+    assert // Tip payment cannot rekey
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:285
+    // assert value_payment.close_remainder_to == Global.zero_address, "Tip payment cannot close account"
+    gtxns CloseRemainderTo
+    global ZeroAddress
+    ==
+    assert // Tip payment cannot close account
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:287
+    // box_key = b"t:" + entity_id_bytes
+    bytec 10 // 0x743a
+    dig 5
+    dup
+    cover 2
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:289
+    // assert not box, "Tip record already exists"
+    dup
+    box_len
+    bury 1
+    !
+    assert // Tip record already exists
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:290
+    // assert not BoxRef(key=b"e:" + entity_id_bytes), "Tip ID already exists in entity namespace"
+    bytec 5 // 0x653a
+    dig 2
+    concat
+    box_len
+    bury 1
+    !
+    assert // Tip ID already exists in entity namespace
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:291
+    // assert not BoxRef(key=b"s:" + entity_id_bytes), "Tip ID already exists in sponsored namespace"
+    bytec 7 // 0x733a
+    uncover 2
+    concat
+    box_len
+    bury 1
+    !
+    assert // Tip ID already exists in sponsored namespace
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:293
+    // Txn.sender.bytes
+    txn Sender
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:294
+    // + op.itob(Global.latest_timestamp)
+    global LatestTimestamp
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:293-294
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:295
+    // + op.itob(Global.latest_timestamp)
+    global LatestTimestamp
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:293-295
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:293-296
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    // + recipient.native.bytes
+    uncover 3
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:297
+    // + op.itob(amount.native)
+    uncover 2
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:293-297
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    // + recipient.native.bytes
+    // + op.itob(amount.native)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:293-298
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    // + recipient.native.bytes
+    // + op.itob(amount.native)
+    // + data
+    dig 3
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:300
+    // self._verify_mbr_payment(BOX_FLAT_MBR + (BOX_BYTE_MBR * (box_key.length + content.length)))
+    dig 1
+    len
+    dig 1
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    callsub _verify_mbr_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:301
+    // box.put(content)
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:259-260
+    // # ============ VERIFIED TIPS ============
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 5
+    concat
+    log
+    intc_1 // 1
+    return
+
+record_tip_bool_false@4:
+    intc_0 // 0
+    b record_tip_bool_merge@5
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.delete_tip[routing]() -> void:
+delete_tip:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:304
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:306
+    // entity_id_bytes = entity_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:307
+    // assert entity_id_bytes.length > 0, "Tip ID cannot be empty"
+    dup
+    len
+    assert // Tip ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:308
+    // box_key = b"t:" + entity_id_bytes
+    bytec 10 // 0x743a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:310
+    // value, exists = box.maybe()
+    dup
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:311
+    // assert exists, "Tip record does not exist"
+    assert // Tip record does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:312
+    // assert value.length >= TIP_HEADER_BYTES, "Corrupted tip record"
+    dup
+    len
+    dup
+    pushint 88
+    >=
+    assert // Corrupted tip record
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:313
+    // assert value[:32] == Txn.sender.bytes, "Only tipper can delete tip record"
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    uncover 2
+    intc_0 // 0
+    uncover 2
+    substring3
+    txn Sender
+    ==
+    assert // Only tipper can delete tip record
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:314
+    // total_size = box_key.length + value.length
+    dig 1
+    len
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:315
+    // assert box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:316
+    // self._refund_full_box_mbr(Txn.sender, total_size)
+    txn Sender
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    uncover 2
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:304
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.sponsored_post[routing]() -> void:
+sponsored_post:
+    intc_0 // 0
+    dupn 3
+    bytec_2 // ""
+    dupn 8
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:318-319
+    // # ============ SPONSORED POSTS ============
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:325
+    // ensure_budget(WRITE_OPCODE_BUDGET, OpUpFeeSource.GroupCredit)
+    intc 11 // 7000
+    intc_0 // 0
+    callsub ensure_budget
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:326
+    // entity_id_bytes = entity_id.native.bytes
+    swap
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:327
+    // entity_data_bytes = entity_data.native.bytes
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:328
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    dup
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:329
+    // assert entity_id_bytes.length <= 62, "Entity ID too long (max 62 bytes)"
+    dup
+    pushint 62
+    <=
+    assert // Entity ID too long (max 62 bytes)
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:330
+    // assert entity_data_bytes.length <= MAX_SPONSORED_DATA, "Sponsored post too large (max 640 bytes)"
+    uncover 2
+    len
+    pushint 640
+    <=
+    assert // Sponsored post too large (max 640 bytes)
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:331
+    // assert entity_id_bytes[:4] != b"tip:", "Tips cannot use sponsored_post"
+    pushint 4
+    dig 1
+    >=
+    pushint 4
+    cover 2
+    select
+    intc_0 // 0
+    swap
+    substring3
+    bytec 12 // 0x7469703a
+    !=
+    assert // Tips cannot use sponsored_post
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:332
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:334-337
+    // # Escrow-funded posting is reserved for canonical registered identities.
+    // # This prevents arbitrary throwaway addresses from using the sponsor pool
+    // # without first consuming the stricter registration quota.
+    // identity_box = BoxRef(key=b"i:" + Txn.sender.bytes)
+    bytec 8 // 0x693a
+    txn Sender
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:338
+    // assert identity_box, "Sponsored posting requires a registered agent identity"
+    box_len
+    bury 1
+    assert // Sponsored posting requires a registered agent identity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:340
+    // today = Global.latest_timestamp // DAY_SECONDS
+    global LatestTimestamp
+    intc 8 // 86400
+    /
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:342-343
+    // # Decode the combined global counter, accepting the preceding v5.6 layout.
+    // packed_global = self.spon_state
+    intc_0 // 0
+    bytec_3 // "spon_state"
+    app_global_get_ex
+    swap
+    dup
+    cover 2
+    cover 3
+    assert // check self.spon_state exists
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:344
+    // sponsored_used = UInt64(0)
+    intc_0 // 0
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:345
+    // registration_used = UInt64(0)
+    intc_0 // 0
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:346
+    // if packed_global // GLOBAL_DAY_RADIX == today:
+    intc 7 // 4096
+    /
+    ==
+    bz sponsored_post_else_body@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:347
+    // sponsored_used = (packed_global // GLOBAL_COUNTER_RADIX) % GLOBAL_COUNTER_RADIX
+    dig 2
+    dup
+    intc_3 // 64
+    /
+    intc_3 // 64
+    %
+    bury 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:348
+    // registration_used = packed_global % GLOBAL_COUNTER_RADIX
+    intc_3 // 64
+    %
+    bury 1
+
+sponsored_post_after_if_else@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:355
+    // assert sponsored_used < GLOBAL_SPONSORED_CAP, "Global daily sponsored cap reached"
+    dig 1
+    pushint 20
+    <
+    assert // Global daily sponsored cap reached
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:357-361
+    // # Accept all historical quota layouts:
+    // # 24-byte legacy: total(8)|day(8)|today_count(8)
+    // # 8-byte v1: day*65536 + total*256 + today_count
+    // # 8-byte v2: day*131072 + registered*65536 + total*256 + today_count
+    // quota_key = b"seed:" + Txn.sender.bytes
+    bytec 13 // 0x736565643a
+    txn Sender
+    concat
+    dup
+    bury 19
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:363
+    // quota_value, quota_exists = quota_box.maybe()
+    box_get
+    dup
+    cover 2
+    bury 14
+    bury 18
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:364
+    // lifetime_total = UInt64(0)
+    intc_0 // 0
+    bury 15
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:365
+    // today_count = UInt64(0)
+    intc_0 // 0
+    bury 9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:366
+    // registered = UInt64(0)
+    intc_0 // 0
+    bury 11
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:367
+    // quota_needs_compaction = False
+    intc_0 // 0
+    bury 12
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:369
+    // if quota_exists:
+    bz sponsored_post_after_if_else@21
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:370
+    // if quota_value.length == 24:
+    dig 16
+    len
+    dup
+    bury 10
+    pushint 24
+    ==
+    bz sponsored_post_else_body@14
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:371
+    // lifetime_total = op.btoi(quota_value[0:8])
+    intc_0 // 0
+    dig 9
+    dup
+    cover 2
+    >=
+    intc_0 // 0
+    dig 2
+    uncover 2
+    select
+    pushint 8
+    dig 2
+    >=
+    pushint 8
+    dig 3
+    uncover 2
+    select
+    dig 19
+    dup
+    cover 4
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    bury 17
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:372
+    // last_day = op.btoi(quota_value[8:16])
+    pushint 16
+    dig 2
+    >=
+    pushint 16
+    uncover 3
+    uncover 2
+    select
+    dup
+    bury 19
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:373
+    // if last_day == today:
+    dig 4
+    ==
+    bz sponsored_post_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:374
+    // today_count = op.btoi(quota_value[16:24])
+    pushint 24
+    dig 9
+    dup
+    cover 2
+    >=
+    pushint 24
+    cover 2
+    select
+    dig 17
+    dig 17
+    uncover 2
+    substring3
+    btoi
+    bury 8
+
+sponsored_post_after_if_else@13:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:375
+    // quota_needs_compaction = True
+    intc_1 // 1
+    bury 11
+
+sponsored_post_after_if_else@21:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:389-391
+    // # A canonical identity must have been created before this method, so a
+    // # missing registered flag can only be a self-funded identity. Preserve it.
+    // assert lifetime_total < LIFETIME_SPONSORED_CAP, "Lifetime sponsored cap reached"
+    dig 13
+    pushint 10
+    <
+    assert // Lifetime sponsored cap reached
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:392
+    // assert today_count < DAILY_SPONSORED_CAP, "Daily sponsored cap reached"
+    dig 7
+    pushint 3
+    <
+    assert // Daily sponsored cap reached
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:394
+    // post_key = b"s:" + entity_id_bytes
+    bytec 7 // 0x733a
+    dig 6
+    dup
+    cover 2
+    concat
+    dup
+    bury 21
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:396
+    // assert not post_box, "Entity already exists (sponsored posts are create-only)"
+    dup
+    box_len
+    bury 1
+    !
+    assert // Entity already exists (sponsored posts are create-only)
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:397
+    // assert not BoxRef(key=b"e:" + entity_id_bytes), "Entity ID already exists in self-funded namespace"
+    bytec 5 // 0x653a
+    dig 2
+    concat
+    box_len
+    bury 1
+    !
+    assert // Entity ID already exists in self-funded namespace
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:398
+    // assert not BoxRef(key=b"t:" + entity_id_bytes), "Entity ID already exists in tip namespace"
+    bytec 10 // 0x743a
+    uncover 2
+    concat
+    box_len
+    bury 1
+    !
+    assert // Entity ID already exists in tip namespace
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:400
+    // Txn.sender.bytes
+    txn Sender
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:401
+    // + op.itob(Global.latest_timestamp)
+    global LatestTimestamp
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:400-401
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:402
+    // + op.itob(Global.latest_timestamp)
+    global LatestTimestamp
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:400-402
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:400-403
+    // Txn.sender.bytes
+    // + op.itob(Global.latest_timestamp)
+    // + op.itob(Global.latest_timestamp)
+    // + entity_data_bytes
+    dig 6
+    concat
+    dup
+    bury 22
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:406
+    // needed = BOX_FLAT_MBR + (BOX_BYTE_MBR * (post_key.length + new_content.length))
+    swap
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:407
+    // if not quota_exists:
+    dig 12
+    bnz sponsored_post_after_if_else@23
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:408
+    // needed += BOX_FLAT_MBR + (BOX_BYTE_MBR * (quota_key.length + 8))
+    dig 18
+    len
+    pushint 8
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    +
+
+sponsored_post_after_if_else@23:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:409
+    // self._verify_sponsor_payment(needed)
+    callsub _verify_sponsor_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:411
+    // post_box.put(new_content)
+    dig 18
+    dig 20
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:412
+    // if quota_needs_compaction:
+    dig 10
+    bz sponsored_post_after_if_else@25
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:413
+    // quota_box.resize(8)
+    dig 17
+    pushint 8
+    box_resize
+
+sponsored_post_after_if_else@25:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:415
+    // (today * QUOTA_V2_DAY_RADIX)
+    dig 3
+    dup
+    intc 9 // 131072
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:416
+    // + (registered * QUOTA_REGISTERED_FLAG)
+    dig 11
+    intc 10 // 65536
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:415-416
+    // (today * QUOTA_V2_DAY_RADIX)
+    // + (registered * QUOTA_REGISTERED_FLAG)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:417
+    // + ((lifetime_total + 1) * QUOTA_LIFETIME_RADIX)
+    dig 15
+    intc_1 // 1
+    +
+    intc 6 // 256
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:415-417
+    // (today * QUOTA_V2_DAY_RADIX)
+    // + (registered * QUOTA_REGISTERED_FLAG)
+    // + ((lifetime_total + 1) * QUOTA_LIFETIME_RADIX)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:418
+    // + (today_count + 1)
+    dig 9
+    intc_1 // 1
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:415-418
+    // (today * QUOTA_V2_DAY_RADIX)
+    // + (registered * QUOTA_REGISTERED_FLAG)
+    // + ((lifetime_total + 1) * QUOTA_LIFETIME_RADIX)
+    // + (today_count + 1)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:420
+    // quota_box.put(op.itob(packed_new_quota))
+    itob
+    dig 19
+    swap
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:422
+    // (today * GLOBAL_DAY_RADIX)
+    intc 7 // 4096
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:423
+    // + ((sponsored_used + 1) * GLOBAL_COUNTER_RADIX)
+    dig 2
+    intc_1 // 1
+    +
+    intc_3 // 64
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:422-423
+    // (today * GLOBAL_DAY_RADIX)
+    // + ((sponsored_used + 1) * GLOBAL_COUNTER_RADIX)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:422-424
+    // (today * GLOBAL_DAY_RADIX)
+    // + ((sponsored_used + 1) * GLOBAL_COUNTER_RADIX)
+    // + registration_used
+    dig 1
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:421
+    // self.spon_state = (
+    bytec_3 // "spon_state"
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:421-425
+    // self.spon_state = (
+    //     (today * GLOBAL_DAY_RADIX)
+    //     + ((sponsored_used + 1) * GLOBAL_COUNTER_RADIX)
+    //     + registration_used
+    // )
+    swap
+    app_global_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:426
+    // op.AppGlobal.delete(b"reg_state")
+    bytec 9 // 0x7265675f7374617465
+    app_global_del
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:318-319
+    // # ============ SPONSORED POSTS ============
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 7
+    concat
+    log
+    intc_1 // 1
+    return
+
+sponsored_post_else_body@14:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:377
+    // assert quota_value.length == 8, "Corrupted quota box"
+    dig 8
+    pushint 8
+    ==
+    assert // Corrupted quota box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:378
+    // packed_quota = op.btoi(quota_value)
+    dig 16
+    btoi
+    dup
+    bury 14
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:379
+    // lifetime_total = (packed_quota // QUOTA_LIFETIME_RADIX) % 256
+    dup
+    intc 6 // 256
+    /
+    intc 6 // 256
+    %
+    bury 15
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:380
+    // raw_v1_day = packed_quota // QUOTA_V1_DAY_RADIX
+    intc 10 // 65536
+    /
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:381
+    // if raw_v1_day <= today:
+    dig 5
+    <=
+    bz sponsored_post_else_body@16
+
+sponsored_post_after_if_else@17:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:386
+    // if last_day == today:
+    dig 4
+    ==
+    bz sponsored_post_after_if_else@21
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:387
+    // today_count = packed_quota % 256
+    dig 12
+    intc 6 // 256
+    %
+    bury 8
+    b sponsored_post_after_if_else@21
+
+sponsored_post_else_body@16:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:384
+    // last_day = packed_quota // QUOTA_V2_DAY_RADIX
+    dig 13
+    intc 9 // 131072
+    /
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:385
+    // registered = (packed_quota // QUOTA_REGISTERED_FLAG) % 2
+    pushint 2
+    %
+    bury 11
+    b sponsored_post_after_if_else@17
+
+sponsored_post_else_body@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:349
+    // elif packed_global // GLOBAL_COUNTER_RADIX == today:
+    dig 2
+    intc_3 // 64
+    /
+    dig 4
+    ==
+    bz sponsored_post_after_if_else@9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:350
+    // sponsored_used = packed_global % GLOBAL_COUNTER_RADIX
+    dig 2
+    intc_3 // 64
+    %
+    bury 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:351
+    // legacy_reg, legacy_reg_exists = op.AppGlobal.get_ex_uint64(0, b"reg_state")
+    intc_0 // 0
+    bytec 9 // 0x7265675f7374617465
+    app_global_get_ex
+    swap
+    bury 16
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:352
+    // if legacy_reg_exists and legacy_reg // GLOBAL_COUNTER_RADIX == today:
+    bz sponsored_post_after_if_else@9
+    dig 14
+    intc_3 // 64
+    /
+    dig 4
+    ==
+    bz sponsored_post_after_if_else@9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:353
+    // registration_used = legacy_reg % GLOBAL_COUNTER_RADIX
+    dig 14
+    intc_3 // 64
+    %
+    bury 1
+    b sponsored_post_after_if_else@9
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.delete_sponsored[routing]() -> void:
+delete_sponsored:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:429
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:431
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:432
+    // entity_id_bytes = entity_id.native.bytes
+    swap
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:433
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:434
+    // box_key = b"s:" + entity_id_bytes
+    bytec 7 // 0x733a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:436
+    // value, exists = box.maybe()
+    dup
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:437
+    // assert exists, "Sponsored entity does not exist"
+    assert // Sponsored entity does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:438
+    // assert value.length >= ENTITY_HEADER_BYTES, "Corrupted sponsored entity"
+    dup
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted sponsored entity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:439
+    // assert value[:32] == Txn.sender.bytes, "Only owner can delete sponsored entity"
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    uncover 2
+    intc_0 // 0
+    uncover 2
+    substring3
+    txn Sender
+    ==
+    assert // Only owner can delete sponsored entity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:440
+    // total_size = box_key.length + value.length
+    dig 1
+    len
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:441
+    // assert box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:442
+    // self._refund_full_box_mbr(Account(self.escrow), total_size)
+    dig 1
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:429
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.sponsored_remaining[routing]() -> void:
+sponsored_remaining:
+    bytec_2 // ""
+    dupn 7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:444
+    // @arc4.abimethod(readonly=True)
+    txna ApplicationArgs 1
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // invalid number of bytes for arc4.static_array<arc4.uint8, 32>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:448
+    // today = Global.latest_timestamp // DAY_SECONDS
+    global LatestTimestamp
+    intc 8 // 86400
+    /
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:449
+    // quota_box = BoxRef(key=b"seed:" + who.native.bytes)
+    bytec 13 // 0x736565643a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:450
+    // quota_value, quota_exists = quota_box.maybe()
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:451
+    // lifetime_total = UInt64(0)
+    intc_0 // 0
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:452
+    // today_count = UInt64(0)
+    intc_0 // 0
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:454
+    // if quota_exists:
+    bz sponsored_remaining_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:455
+    // if quota_value.length == 24:
+    dig 2
+    len
+    dup
+    bury 6
+    pushint 24
+    ==
+    bz sponsored_remaining_else_body@6
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:456
+    // lifetime_total = op.btoi(quota_value[0:8])
+    intc_0 // 0
+    dig 5
+    dup
+    cover 2
+    >=
+    intc_0 // 0
+    dig 2
+    uncover 2
+    select
+    pushint 8
+    dig 2
+    >=
+    pushint 8
+    dig 3
+    uncover 2
+    select
+    dig 5
+    dup
+    cover 4
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    bury 5
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:457
+    // if op.btoi(quota_value[8:16]) == today:
+    pushint 16
+    dig 2
+    >=
+    pushint 16
+    uncover 3
+    uncover 2
+    select
+    dup
+    bury 15
+    substring3
+    btoi
+    dig 4
+    ==
+    bz sponsored_remaining_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:458
+    // today_count = op.btoi(quota_value[16:24])
+    pushint 24
+    dig 5
+    dup
+    cover 2
+    >=
+    pushint 24
+    cover 2
+    select
+    dig 3
+    dig 13
+    uncover 2
+    substring3
+    btoi
+    bury 1
+
+sponsored_remaining_after_if_else@13:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:470
+    // if lifetime_total < LIFETIME_SPONSORED_CAP
+    dig 1
+    pushint 10
+    <
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:469-471
+    // LIFETIME_SPONSORED_CAP - lifetime_total
+    // if lifetime_total < LIFETIME_SPONSORED_CAP
+    // else UInt64(0)
+    bz sponsored_remaining_ternary_false@15
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:469
+    // LIFETIME_SPONSORED_CAP - lifetime_total
+    pushint 10
+    dig 2
+    -
+    bury 10
+
+sponsored_remaining_ternary_merge@16:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:475
+    // if today_count < DAILY_SPONSORED_CAP
+    dup
+    pushint 3
+    <
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:474-476
+    // DAILY_SPONSORED_CAP - today_count
+    // if today_count < DAILY_SPONSORED_CAP
+    // else UInt64(0)
+    bz sponsored_remaining_ternary_false@18
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:474
+    // DAILY_SPONSORED_CAP - today_count
+    pushint 3
+    dig 1
+    -
+    bury 11
+
+sponsored_remaining_ternary_merge@19:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:479
+    // packed_global = self.spon_state
+    intc_0 // 0
+    bytec_3 // "spon_state"
+    app_global_get_ex
+    swap
+    dup
+    cover 2
+    bury 11
+    assert // check self.spon_state exists
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:480
+    // sponsored_used = UInt64(0)
+    intc_0 // 0
+    bury 7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:481
+    // if packed_global // GLOBAL_DAY_RADIX == today:
+    intc 7 // 4096
+    /
+    dig 4
+    ==
+    bz sponsored_remaining_else_body@21
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:482
+    // sponsored_used = (packed_global // GLOBAL_COUNTER_RADIX) % GLOBAL_COUNTER_RADIX
+    dig 8
+    intc_3 // 64
+    /
+    intc_3 // 64
+    %
+    bury 6
+
+sponsored_remaining_after_if_else@24:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:488
+    // if sponsored_used < GLOBAL_SPONSORED_CAP
+    dig 5
+    pushint 20
+    <
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:487-489
+    // GLOBAL_SPONSORED_CAP - sponsored_used
+    // if sponsored_used < GLOBAL_SPONSORED_CAP
+    // else UInt64(0)
+    bz sponsored_remaining_ternary_false@26
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:487
+    // GLOBAL_SPONSORED_CAP - sponsored_used
+    pushint 20
+    dig 6
+    -
+
+sponsored_remaining_ternary_merge@27:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:491
+    // return arc4.UInt64(life_left), arc4.UInt64(day_left), arc4.UInt64(global_left)
+    dig 10
+    itob
+    dig 12
+    itob
+    uncover 2
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:444
+    // @arc4.abimethod(readonly=True)
+    cover 2
+    concat
+    swap
+    concat
+    bytec_1 // 0x151f7c75
+    swap
+    concat
+    log
+    intc_1 // 1
+    return
+
+sponsored_remaining_ternary_false@26:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:489
+    // else UInt64(0)
+    intc_0 // 0
+    b sponsored_remaining_ternary_merge@27
+
+sponsored_remaining_else_body@21:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:483
+    // elif packed_global // GLOBAL_COUNTER_RADIX == today:
+    dig 8
+    intc_3 // 64
+    /
+    dig 4
+    ==
+    bz sponsored_remaining_after_if_else@24
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:484
+    // sponsored_used = packed_global % GLOBAL_COUNTER_RADIX
+    dig 8
+    intc_3 // 64
+    %
+    bury 6
+    b sponsored_remaining_after_if_else@24
+
+sponsored_remaining_ternary_false@18:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:476
+    // else UInt64(0)
+    intc_0 // 0
+    bury 11
+    b sponsored_remaining_ternary_merge@19
+
+sponsored_remaining_ternary_false@15:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:471
+    // else UInt64(0)
+    intc_0 // 0
+    bury 10
+    b sponsored_remaining_ternary_merge@16
+
+sponsored_remaining_else_body@6:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:460
+    // assert quota_value.length == 8, "Corrupted quota box"
+    dig 4
+    pushint 8
+    ==
+    assert // Corrupted quota box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:461
+    // packed_quota = op.btoi(quota_value)
+    dig 2
+    btoi
+    dup
+    bury 9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:462
+    // lifetime_total = (packed_quota // QUOTA_LIFETIME_RADIX) % 256
+    dup
+    intc 6 // 256
+    /
+    intc 6 // 256
+    %
+    bury 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:463
+    // raw_v1_day = packed_quota // QUOTA_V1_DAY_RADIX
+    intc 10 // 65536
+    /
+    dup
+    bury 8
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:464
+    // last_day = raw_v1_day if raw_v1_day <= today else packed_quota // QUOTA_V2_DAY_RADIX
+    dig 4
+    <=
+    bz sponsored_remaining_ternary_false@8
+    dig 6
+
+sponsored_remaining_ternary_merge@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:465
+    // if last_day == today:
+    dig 4
+    ==
+    bz sponsored_remaining_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:466
+    // today_count = packed_quota % 256
+    dig 7
+    intc 6 // 256
+    %
+    bury 1
+    b sponsored_remaining_after_if_else@13
+
+sponsored_remaining_ternary_false@8:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:464
+    // last_day = raw_v1_day if raw_v1_day <= today else packed_quota // QUOTA_V2_DAY_RADIX
+    dig 7
+    intc 9 // 131072
+    /
+    b sponsored_remaining_ternary_merge@9
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.recycle_surplus[routing]() -> void:
+recycle_surplus:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:495-497
+    // # Permissionless and destination-fixed. The caller must pool one extra
+    // # transaction fee when a non-zero inner refund is emitted.
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:498
+    // app = Global.current_application_address
+    global CurrentApplicationAddress
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:499
+    // spendable = app.balance - app.min_balance
+    dup
+    acct_params_get AcctBalance
+    assert // account funded
+    swap
+    acct_params_get AcctMinBalance
+    assert // account funded
+    -
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:500
+    // self._pay(Account(self.escrow), spendable)
+    dig 1
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    callsub _pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:493
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.register_agent[routing]() -> void:
+register_agent:
+    intc_0 // 0
+    dupn 3
+    bytec_2 // ""
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:522
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:524
+    // ensure_budget(WRITE_OPCODE_BUDGET, OpUpFeeSource.GroupCredit)
+    intc 11 // 7000
+    intc_0 // 0
+    callsub ensure_budget
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:525
+    // name = display_name.native.bytes
+    swap
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:526
+    // metadata = metadata_json.native.bytes
+    extract 2 0
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:527
+    // self._validate_agent_name(name)
+    dig 1
+    callsub _validate_agent_name
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:528
+    // assert metadata.length <= MAX_AGENT_METADATA, "Agent metadata too large"
+    len
+    pushint 384
+    <=
+    assert // Agent metadata too large
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:530
+    // identity_key = b"i:" + Txn.sender.bytes
+    bytec 8 // 0x693a
+    txn Sender
+    concat
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:531
+    // address_key = b"a:" + Txn.sender.bytes
+    bytec 14 // 0x613a
+    txn Sender
+    concat
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:532
+    // name_hash = op.sha256(name)
+    swap
+    sha256
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:533
+    // name_key = b"n:" + name_hash
+    bytec 11 // 0x6e3a
+    swap
+    concat
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:537
+    // assert not identity_box, "Address already has an active agent identity"
+    box_len
+    bury 1
+    !
+    assert // Address already has an active agent identity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:539-541
+    // # Two permanent indexes enforce a bijection: one name can belong to only
+    // # one address, and one address can ever own only its first chosen name.
+    // permanent_created_timestamp = Global.latest_timestamp
+    global LatestTimestamp
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:542
+    // name_value, name_exists = name_box.maybe()
+    box_get
+    dup
+    uncover 2
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:543
+    // if name_exists:
+    bz register_agent_after_if_else@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:544
+    // assert name_value.length >= 48, "Corrupted agent name index"
+    dupn 2
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:545
+    // assert name_value[:32] == Txn.sender.bytes, "Display name permanently belongs to another address"
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    txn Sender
+    ==
+    assert // Display name permanently belongs to another address
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:546
+    // permanent_created_timestamp = op.btoi(name_value[32:40])
+    pushint 40
+    dig 2
+    >=
+    pushint 40
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    dup
+    bury 7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:547
+    // assert permanent_created_timestamp > 0, "Corrupted agent name index"
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:548
+    // stored_name_len = op.btoi(name_value[40:48])
+    pushint 48
+    dig 2
+    >=
+    pushint 48
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:549
+    // assert stored_name_len == name.length, "Corrupted agent name index"
+    dig 12
+    dup
+    cover 2
+    len
+    ==
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:550
+    // assert name_value[48:] == name, "Corrupted agent name index"
+    uncover 3
+    uncover 2
+    uncover 3
+    substring3
+    ==
+    assert // Corrupted agent name index
+
+register_agent_after_if_else@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:552
+    // address_value, address_exists = address_box.maybe()
+    dig 5
+    box_get
+    dup
+    cover 2
+    bury 14
+    bury 17
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:553
+    // if address_exists:
+    bz register_agent_after_if_else@5
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:554
+    // assert address_value.length >= 48, "Corrupted address-name lock"
+    dig 15
+    dup
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted address-name lock
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:555
+    // assert address_value[:32] == name_hash, "Address is permanently bound to another name"
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    dig 8
+    ==
+    assert // Address is permanently bound to another name
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:556
+    // address_created_timestamp = op.btoi(address_value[32:40])
+    pushint 40
+    dig 2
+    >=
+    pushint 40
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:557
+    // assert address_created_timestamp == permanent_created_timestamp, "Permanent identity timestamp mismatch"
+    dig 6
+    ==
+    assert // Permanent identity timestamp mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:558
+    // stored_address_name_len = op.btoi(address_value[40:48])
+    pushint 48
+    dig 2
+    >=
+    pushint 48
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:559
+    // assert stored_address_name_len == name.length, "Corrupted address-name lock"
+    dig 12
+    dup
+    cover 2
+    len
+    ==
+    assert // Corrupted address-name lock
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:560
+    // assert address_value[48:] == name, "Corrupted address-name lock"
+    uncover 3
+    uncover 2
+    uncover 3
+    substring3
+    ==
+    assert // Corrupted address-name lock
+
+register_agent_after_if_else@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:562
+    // identity_value = op.itob(UInt64(0)) + op.itob(permanent_created_timestamp) + name_hash + op.itob(name.length) + name + metadata
+    intc_0 // 0
+    itob
+    dig 3
+    itob
+    dup
+    bury 16
+    concat
+    dig 5
+    concat
+    dig 9
+    dup
+    cover 2
+    len
+    itob
+    dup
+    bury 16
+    concat
+    swap
+    concat
+    dig 8
+    concat
+    dup
+    bury 16
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:563
+    // needed = BOX_FLAT_MBR + (BOX_BYTE_MBR * (identity_key.length + identity_value.length))
+    dig 7
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    bury 11
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:564
+    // if not name_exists:
+    dig 1
+    bnz register_agent_after_if_else@7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:565
+    // name_value = Txn.sender.bytes + op.itob(permanent_created_timestamp) + op.itob(name.length) + name
+    txn Sender
+    dig 14
+    concat
+    dig 13
+    concat
+    dig 9
+    concat
+    dup
+    bury 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:566
+    // needed += BOX_FLAT_MBR + (BOX_BYTE_MBR * (name_key.length + name_value.length))
+    dig 4
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    dig 11
+    +
+    bury 11
+
+register_agent_after_if_else@7:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:567
+    // if not address_exists:
+    dig 11
+    bnz register_agent_after_if_else@9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:568
+    // address_value = name_hash + op.itob(permanent_created_timestamp) + op.itob(name.length) + name
+    dig 4
+    dig 14
+    concat
+    dig 13
+    concat
+    dig 9
+    concat
+    dup
+    bury 17
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:569
+    // needed += BOX_FLAT_MBR + (BOX_BYTE_MBR * (address_key.length + address_value.length))
+    dig 6
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    dig 11
+    +
+    bury 11
+
+register_agent_after_if_else@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:571
+    // self._verify_mbr_payment(needed)
+    dig 10
+    callsub _verify_mbr_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:572
+    // identity_box.put(identity_value)
+    dig 6
+    dig 15
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:573
+    // if not name_exists:
+    dig 1
+    bnz register_agent_after_if_else@11
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:574
+    // name_box.put(name_value)
+    dig 3
+    dig 1
+    box_put
+
+register_agent_after_if_else@11:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:575
+    // if not address_exists:
+    dig 11
+    bnz register_agent_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:576
+    // address_box.put(address_value)
+    dig 5
+    dig 16
+    box_put
+
+register_agent_after_if_else@13:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:522
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 10
+    concat
+    log
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.sponsored_register_agent[routing]() -> void:
+sponsored_register_agent:
+    intc_0 // 0
+    dupn 5
+    bytec_2 // ""
+    dupn 14
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:579
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:585
+    // ensure_budget(WRITE_OPCODE_BUDGET, OpUpFeeSource.GroupCredit)
+    intc 11 // 7000
+    intc_0 // 0
+    callsub ensure_budget
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:586
+    // name = display_name.native.bytes
+    swap
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:587
+    // metadata = metadata_json.native.bytes
+    extract 2 0
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:588
+    // self._validate_agent_name(name)
+    dig 1
+    callsub _validate_agent_name
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:589
+    // assert metadata.length <= MAX_AGENT_METADATA, "Agent metadata too large"
+    len
+    pushint 384
+    <=
+    assert // Agent metadata too large
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:590
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:592
+    // identity_key = b"i:" + Txn.sender.bytes
+    bytec 8 // 0x693a
+    txn Sender
+    concat
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:593
+    // address_key = b"a:" + Txn.sender.bytes
+    bytec 14 // 0x613a
+    txn Sender
+    concat
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:594
+    // name_hash = op.sha256(name)
+    swap
+    sha256
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:595
+    // name_key = b"n:" + name_hash
+    bytec 11 // 0x6e3a
+    swap
+    concat
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:599
+    // assert not identity_box, "Address already has an active agent identity"
+    box_len
+    bury 1
+    !
+    assert // Address already has an active agent identity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:601
+    // permanent_created_timestamp = Global.latest_timestamp
+    global LatestTimestamp
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:602
+    // name_value, name_exists = name_box.maybe()
+    box_get
+    dup
+    uncover 2
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:603
+    // if name_exists:
+    bz sponsored_register_agent_after_if_else@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:604
+    // assert name_value.length >= 48, "Corrupted agent name index"
+    dupn 2
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:605
+    // assert name_value[:32] == Txn.sender.bytes, "Display name permanently belongs to another address"
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    txn Sender
+    ==
+    assert // Display name permanently belongs to another address
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:606
+    // permanent_created_timestamp = op.btoi(name_value[32:40])
+    pushint 40
+    dig 2
+    >=
+    pushint 40
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    dup
+    bury 7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:607
+    // assert permanent_created_timestamp > 0, "Corrupted agent name index"
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:608
+    // stored_name_len = op.btoi(name_value[40:48])
+    pushint 48
+    dig 2
+    >=
+    pushint 48
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:609
+    // assert stored_name_len == name.length, "Corrupted agent name index"
+    dig 12
+    dup
+    cover 2
+    len
+    ==
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:610
+    // assert name_value[48:] == name, "Corrupted agent name index"
+    uncover 3
+    uncover 2
+    uncover 3
+    substring3
+    ==
+    assert // Corrupted agent name index
+
+sponsored_register_agent_after_if_else@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:612
+    // address_value, address_exists = address_box.maybe()
+    dig 5
+    box_get
+    dup
+    cover 2
+    bury 27
+    bury 32
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:613
+    // if address_exists:
+    bz sponsored_register_agent_after_if_else@5
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:614
+    // assert address_value.length >= 48, "Corrupted address-name lock"
+    dig 30
+    dup
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted address-name lock
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:615
+    // assert address_value[:32] == name_hash, "Address is permanently bound to another name"
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    dig 8
+    ==
+    assert // Address is permanently bound to another name
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:616
+    // address_created_timestamp = op.btoi(address_value[32:40])
+    pushint 40
+    dig 2
+    >=
+    pushint 40
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:617
+    // assert address_created_timestamp == permanent_created_timestamp, "Permanent identity timestamp mismatch"
+    dig 6
+    ==
+    assert // Permanent identity timestamp mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:618
+    // stored_address_name_len = op.btoi(address_value[40:48])
+    pushint 48
+    dig 2
+    >=
+    pushint 48
+    dig 3
+    uncover 2
+    select
+    dig 3
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:619
+    // assert stored_address_name_len == name.length, "Corrupted address-name lock"
+    dig 12
+    dup
+    cover 2
+    len
+    ==
+    assert // Corrupted address-name lock
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:620
+    // assert address_value[48:] == name, "Corrupted address-name lock"
+    uncover 3
+    uncover 2
+    uncover 3
+    substring3
+    ==
+    assert // Corrupted address-name lock
+
+sponsored_register_agent_after_if_else@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:622
+    // today = Global.latest_timestamp // DAY_SECONDS
+    global LatestTimestamp
+    intc 8 // 86400
+    /
+    dup
+    bury 13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:623
+    // packed_global = self.spon_state
+    intc_0 // 0
+    bytec_3 // "spon_state"
+    app_global_get_ex
+    swap
+    dup
+    cover 2
+    bury 23
+    assert // check self.spon_state exists
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:624
+    // sponsored_used = UInt64(0)
+    intc_0 // 0
+    bury 16
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:625
+    // registration_used = UInt64(0)
+    intc_0 // 0
+    bury 17
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:626
+    // if packed_global // GLOBAL_DAY_RADIX == today:
+    intc 7 // 4096
+    /
+    ==
+    bz sponsored_register_agent_else_body@7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:627
+    // sponsored_used = (packed_global // GLOBAL_COUNTER_RADIX) % GLOBAL_COUNTER_RADIX
+    dig 19
+    dup
+    intc_3 // 64
+    /
+    intc_3 // 64
+    %
+    bury 15
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:628
+    // registration_used = packed_global % GLOBAL_COUNTER_RADIX
+    intc_3 // 64
+    %
+    bury 15
+
+sponsored_register_agent_after_if_else@13:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:634
+    // assert registration_used < REG_DAILY_CAP, "Daily sponsored-registration cap reached"
+    dig 14
+    pushint 5
+    <
+    assert // Daily sponsored-registration cap reached
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:636
+    // quota_key = b"seed:" + Txn.sender.bytes
+    bytec 13 // 0x736565643a
+    txn Sender
+    concat
+    dup
+    bury 30
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:638
+    // quota_value, quota_exists = quota_box.maybe()
+    box_get
+    dup
+    cover 2
+    bury 20
+    bury 29
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:639
+    // lifetime_total = UInt64(0)
+    intc_0 // 0
+    bury 23
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:640
+    // today_count = UInt64(0)
+    intc_0 // 0
+    bury 12
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:641
+    // registered = UInt64(0)
+    intc_0 // 0
+    bury 17
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:642
+    // quota_needs_compaction = False
+    intc_0 // 0
+    bury 18
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:643
+    // if quota_exists:
+    bz sponsored_register_agent_after_if_else@25
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:644
+    // if quota_value.length == 24:
+    dig 27
+    len
+    dup
+    bury 14
+    pushint 24
+    ==
+    bz sponsored_register_agent_else_body@18
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:645
+    // lifetime_total = op.btoi(quota_value[0:8])
+    intc_0 // 0
+    dig 13
+    dup
+    cover 2
+    >=
+    intc_0 // 0
+    dig 2
+    uncover 2
+    select
+    pushint 8
+    dig 2
+    >=
+    pushint 8
+    dig 3
+    uncover 2
+    select
+    dig 30
+    dup
+    cover 4
+    uncover 2
+    dig 2
+    substring3
+    btoi
+    bury 25
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:646
+    // if op.btoi(quota_value[8:16]) == today:
+    pushint 16
+    dig 2
+    >=
+    pushint 16
+    uncover 3
+    uncover 2
+    select
+    dup
+    bury 27
+    substring3
+    btoi
+    dig 12
+    ==
+    bz sponsored_register_agent_after_if_else@17
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:647
+    // today_count = op.btoi(quota_value[16:24])
+    pushint 24
+    dig 13
+    dup
+    cover 2
+    >=
+    pushint 24
+    cover 2
+    select
+    dig 28
+    dig 25
+    uncover 2
+    substring3
+    btoi
+    bury 11
+
+sponsored_register_agent_after_if_else@17:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:648
+    // quota_needs_compaction = True
+    intc_1 // 1
+    bury 17
+
+sponsored_register_agent_after_if_else@25:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:661
+    // assert registered == 0, "Address already used sponsored registration"
+    dig 15
+    !
+    assert // Address already used sponsored registration
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:663
+    // identity_value = op.itob(UInt64(1)) + op.itob(permanent_created_timestamp) + name_hash + op.itob(name.length) + name + metadata
+    intc_1 // 1
+    itob
+    dig 3
+    itob
+    dup
+    bury 29
+    concat
+    dig 5
+    concat
+    dig 9
+    dup
+    cover 2
+    len
+    itob
+    dup
+    bury 29
+    concat
+    swap
+    concat
+    dig 8
+    concat
+    dup
+    bury 31
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:664
+    // needed = BOX_FLAT_MBR + (BOX_BYTE_MBR * (identity_key.length + identity_value.length))
+    dig 7
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    bury 21
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:665
+    // if not name_exists:
+    dig 1
+    bnz sponsored_register_agent_after_if_else@27
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:666
+    // name_value = Txn.sender.bytes + op.itob(permanent_created_timestamp) + op.itob(name.length) + name
+    txn Sender
+    dig 27
+    concat
+    dig 26
+    concat
+    dig 9
+    concat
+    dup
+    bury 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:667
+    // needed += BOX_FLAT_MBR + (BOX_BYTE_MBR * (name_key.length + name_value.length))
+    dig 4
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    dig 21
+    +
+    bury 21
+
+sponsored_register_agent_after_if_else@27:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:668
+    // if not address_exists:
+    dig 24
+    bnz sponsored_register_agent_after_if_else@29
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:669
+    // address_value = name_hash + op.itob(permanent_created_timestamp) + op.itob(name.length) + name
+    dig 4
+    dig 27
+    concat
+    dig 26
+    concat
+    dig 9
+    concat
+    dup
+    bury 32
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:670
+    // needed += BOX_FLAT_MBR + (BOX_BYTE_MBR * (address_key.length + address_value.length))
+    dig 6
+    len
+    swap
+    len
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    dig 21
+    +
+    bury 21
+
+sponsored_register_agent_after_if_else@29:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:671
+    // if not quota_exists:
+    dig 17
+    bnz sponsored_register_agent_after_if_else@31
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:672
+    // needed += BOX_FLAT_MBR + (BOX_BYTE_MBR * (quota_key.length + 8))
+    dig 28
+    len
+    pushint 8
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    dig 21
+    +
+    bury 21
+
+sponsored_register_agent_after_if_else@31:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:673
+    // self._verify_sponsor_payment(needed)
+    dig 20
+    callsub _verify_sponsor_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:675
+    // identity_box.put(identity_value)
+    dig 6
+    dig 30
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:676
+    // if not name_exists:
+    dig 1
+    bnz sponsored_register_agent_after_if_else@33
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:677
+    // name_box.put(name_value)
+    dig 3
+    dig 1
+    box_put
+
+sponsored_register_agent_after_if_else@33:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:678
+    // if not address_exists:
+    dig 24
+    bnz sponsored_register_agent_after_if_else@35
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:679
+    // address_box.put(address_value)
+    dig 5
+    dig 31
+    box_put
+
+sponsored_register_agent_after_if_else@35:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:680
+    // if quota_needs_compaction:
+    dig 16
+    bz sponsored_register_agent_after_if_else@37
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:681
+    // quota_box.resize(8)
+    dig 28
+    pushint 8
+    box_resize
+
+sponsored_register_agent_after_if_else@37:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:683
+    // (today * QUOTA_V2_DAY_RADIX)
+    dig 11
+    dup
+    intc 9 // 131072
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:684
+    // + QUOTA_REGISTERED_FLAG
+    intc 10 // 65536
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:683-684
+    // (today * QUOTA_V2_DAY_RADIX)
+    // + QUOTA_REGISTERED_FLAG
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:685
+    // + (lifetime_total * QUOTA_LIFETIME_RADIX)
+    dig 23
+    intc 6 // 256
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:683-685
+    // (today * QUOTA_V2_DAY_RADIX)
+    // + QUOTA_REGISTERED_FLAG
+    // + (lifetime_total * QUOTA_LIFETIME_RADIX)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:683-686
+    // (today * QUOTA_V2_DAY_RADIX)
+    // + QUOTA_REGISTERED_FLAG
+    // + (lifetime_total * QUOTA_LIFETIME_RADIX)
+    // + today_count
+    dig 12
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:688
+    // quota_box.put(op.itob(packed_new_quota))
+    itob
+    dig 30
+    swap
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:690
+    // (today * GLOBAL_DAY_RADIX)
+    intc 7 // 4096
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:691
+    // + (sponsored_used * GLOBAL_COUNTER_RADIX)
+    dig 14
+    intc_3 // 64
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:690-691
+    // (today * GLOBAL_DAY_RADIX)
+    // + (sponsored_used * GLOBAL_COUNTER_RADIX)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:692
+    // + (registration_used + 1)
+    dig 15
+    intc_1 // 1
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:690-692
+    // (today * GLOBAL_DAY_RADIX)
+    // + (sponsored_used * GLOBAL_COUNTER_RADIX)
+    // + (registration_used + 1)
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:689
+    // self.spon_state = (
+    bytec_3 // "spon_state"
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:689-693
+    // self.spon_state = (
+    //     (today * GLOBAL_DAY_RADIX)
+    //     + (sponsored_used * GLOBAL_COUNTER_RADIX)
+    //     + (registration_used + 1)
+    // )
+    swap
+    app_global_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:694
+    // op.AppGlobal.delete(b"reg_state")
+    bytec 9 // 0x7265675f7374617465
+    app_global_del
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:579
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 10
+    concat
+    log
+    intc_1 // 1
+    return
+
+sponsored_register_agent_else_body@18:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:650
+    // assert quota_value.length == 8, "Corrupted quota box"
+    dig 12
+    pushint 8
+    ==
+    assert // Corrupted quota box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:651
+    // packed_quota = op.btoi(quota_value)
+    dig 27
+    btoi
+    dup
+    bury 20
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:652
+    // lifetime_total = (packed_quota // QUOTA_LIFETIME_RADIX) % 256
+    dup
+    intc 6 // 256
+    /
+    intc 6 // 256
+    %
+    bury 23
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:653
+    // raw_v1_day = packed_quota // QUOTA_V1_DAY_RADIX
+    intc 10 // 65536
+    /
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:654
+    // if raw_v1_day <= today:
+    dig 13
+    <=
+    bz sponsored_register_agent_else_body@20
+
+sponsored_register_agent_after_if_else@21:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:659
+    // if last_day == today:
+    dig 12
+    ==
+    bz sponsored_register_agent_after_if_else@25
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:660
+    // today_count = packed_quota % 256
+    dig 18
+    intc 6 // 256
+    %
+    bury 11
+    b sponsored_register_agent_after_if_else@25
+
+sponsored_register_agent_else_body@20:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:657
+    // last_day = packed_quota // QUOTA_V2_DAY_RADIX
+    dig 19
+    intc 9 // 131072
+    /
+    swap
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:658
+    // registered = (packed_quota // QUOTA_REGISTERED_FLAG) % 2
+    pushint 2
+    %
+    bury 17
+    b sponsored_register_agent_after_if_else@21
+
+sponsored_register_agent_else_body@7:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:629
+    // elif packed_global // GLOBAL_COUNTER_RADIX == today:
+    dig 19
+    intc_3 // 64
+    /
+    dig 12
+    ==
+    bz sponsored_register_agent_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:630
+    // sponsored_used = packed_global % GLOBAL_COUNTER_RADIX
+    dig 19
+    intc_3 // 64
+    %
+    bury 14
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:631
+    // legacy_reg, legacy_reg_exists = op.AppGlobal.get_ex_uint64(0, b"reg_state")
+    intc_0 // 0
+    bytec 9 // 0x7265675f7374617465
+    app_global_get_ex
+    swap
+    bury 24
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:632
+    // if legacy_reg_exists and legacy_reg // GLOBAL_COUNTER_RADIX == today:
+    bz sponsored_register_agent_after_if_else@13
+    dig 22
+    intc_3 // 64
+    /
+    dig 12
+    ==
+    bz sponsored_register_agent_after_if_else@13
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:633
+    // registration_used = legacy_reg % GLOBAL_COUNTER_RADIX
+    dig 22
+    intc_3 // 64
+    %
+    bury 15
+    b sponsored_register_agent_after_if_else@13
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.agent_name_available[routing]() -> void:
+agent_name_available:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:697
+    // @arc4.abimethod(readonly=True)
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:699
+    // ensure_budget(NAME_CHECK_OPCODE_BUDGET, OpUpFeeSource.GroupCredit)
+    pushint 1600
+    intc_0 // 0
+    callsub ensure_budget
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:700
+    // name = display_name.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:701
+    // self._validate_agent_name(name)
+    dup
+    callsub _validate_agent_name
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:702
+    // name_box = BoxRef(key=b"n:" + op.sha256(name))
+    sha256
+    bytec 11 // 0x6e3a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:703
+    // return arc4.Bool(not name_box)
+    box_len
+    bury 1
+    !
+    bytec 6 // 0x00
+    intc_0 // 0
+    uncover 2
+    setbit
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:697
+    // @arc4.abimethod(readonly=True)
+    bytec_1 // 0x151f7c75
+    swap
+    concat
+    log
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.delete_agent[routing]() -> void:
+delete_agent:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:707
+    // identity_key = b"i:" + Txn.sender.bytes
+    bytec 8 // 0x693a
+    txn Sender
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:709
+    // identity_value, exists = identity_box.maybe()
+    dup
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:710
+    // assert exists, "Agent identity does not exist"
+    assert // Agent identity does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:711
+    // assert identity_value.length >= 56, "Corrupted agent identity"
+    dup
+    len
+    dup
+    pushint 56
+    >=
+    assert // Corrupted agent identity
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:712
+    // funding_flag = op.btoi(identity_value[0:8])
+    intc_0 // 0
+    dig 1
+    >=
+    intc_0 // 0
+    dig 2
+    uncover 2
+    select
+    pushint 8
+    dig 2
+    >=
+    pushint 8
+    dig 3
+    uncover 2
+    select
+    dig 3
+    cover 2
+    substring3
+    btoi
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:713
+    // name_hash = identity_value[16:48]
+    pushint 16
+    dig 2
+    >=
+    pushint 16
+    dig 3
+    uncover 2
+    select
+    pushint 48
+    dig 3
+    >=
+    pushint 48
+    dig 4
+    uncover 2
+    select
+    uncover 4
+    cover 2
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:714
+    // name_key = b"n:" + name_hash
+    bytec 11 // 0x6e3a
+    dig 1
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:715
+    // address_key = b"a:" + Txn.sender.bytes
+    bytec 14 // 0x613a
+    txn Sender
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:718
+    // name_value, name_exists = name_box.maybe()
+    swap
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:719
+    // address_value, address_exists = address_box.maybe()
+    uncover 2
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:720
+    // assert name_exists, "Corrupted agent name index"
+    uncover 2
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:721
+    // assert address_exists, "Corrupted address-name lock"
+    assert // Corrupted address-name lock
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:722
+    // assert name_value.length >= 48, "Corrupted agent name index"
+    dig 1
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted agent name index
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:723
+    // assert address_value.length >= 48, "Corrupted address-name lock"
+    dig 1
+    len
+    dup
+    pushint 48
+    >=
+    assert // Corrupted address-name lock
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:724
+    // assert name_value[:32] == Txn.sender.bytes, "Name index owner mismatch"
+    intc_2 // 32
+    dig 2
+    >=
+    intc_2 // 32
+    dig 3
+    uncover 2
+    select
+    dig 4
+    intc_0 // 0
+    dig 2
+    substring3
+    txn Sender
+    ==
+    assert // Name index owner mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:725
+    // assert address_value[:32] == name_hash, "Address-name lock mismatch"
+    intc_2 // 32
+    dig 2
+    >=
+    intc_2 // 32
+    dig 3
+    uncover 2
+    select
+    dig 4
+    intc_0 // 0
+    dig 2
+    substring3
+    uncover 7
+    ==
+    assert // Address-name lock mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:726
+    // assert name_value[32:40] == address_value[32:40], "Permanent identity timestamp mismatch"
+    pushint 40
+    dig 4
+    >=
+    pushint 40
+    uncover 5
+    uncover 2
+    select
+    uncover 5
+    uncover 3
+    uncover 2
+    substring3
+    pushint 40
+    dig 3
+    >=
+    pushint 40
+    uncover 4
+    uncover 2
+    select
+    uncover 3
+    uncover 3
+    uncover 2
+    substring3
+    ==
+    assert // Permanent identity timestamp mismatch
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:728-731
+    // # Retiring an identity never deletes the n: or a: permanent bindings. The exact name
+    // # remains permanently reserved to this address and can only be reactivated
+    // # by the same address through register_agent.
+    // identity_refund = BOX_FLAT_MBR + (BOX_BYTE_MBR * (identity_key.length + identity_value.length))
+    dig 2
+    len
+    uncover 2
+    +
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:732
+    // assert identity_box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:733
+    // if funding_flag == 0:
+    bnz delete_agent_else_body@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:734
+    // self._pay(Txn.sender, identity_refund)
+    txn Sender
+    swap
+    callsub _pay
+
+delete_agent_after_if_else@4:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:705
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+delete_agent_else_body@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:736
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:737
+    // self._pay(Account(self.escrow), identity_refund)
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    swap
+    callsub _pay
+    b delete_agent_after_if_else@4
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.reg_remaining[routing]() -> void:
+reg_remaining:
+    bytec_2 // ""
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:745
+    // today = Global.latest_timestamp // DAY_SECONDS
+    global LatestTimestamp
+    intc 8 // 86400
+    /
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:746
+    // packed_global = self.spon_state
+    intc_0 // 0
+    bytec_3 // "spon_state"
+    app_global_get_ex
+    swap
+    dup
+    cover 2
+    cover 3
+    assert // check self.spon_state exists
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:747
+    // registration_used = UInt64(0)
+    intc_0 // 0
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:748
+    // if packed_global // GLOBAL_DAY_RADIX == today:
+    intc 7 // 4096
+    /
+    ==
+    bz reg_remaining_else_body@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:749
+    // registration_used = packed_global % GLOBAL_COUNTER_RADIX
+    dig 1
+    intc_3 // 64
+    %
+    bury 1
+
+reg_remaining_after_if_else@7:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:757
+    // if registration_used < REG_DAILY_CAP
+    dup
+    pushint 5
+    <
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:756-758
+    // REG_DAILY_CAP - registration_used
+    // if registration_used < REG_DAILY_CAP
+    // else UInt64(0)
+    bz reg_remaining_ternary_false@9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:756
+    // REG_DAILY_CAP - registration_used
+    pushint 5
+    dig 1
+    -
+
+reg_remaining_ternary_merge@10:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:760
+    // return arc4.UInt64(left)
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:743
+    // @arc4.abimethod(readonly=True)
+    bytec_1 // 0x151f7c75
+    swap
+    concat
+    log
+    intc_1 // 1
+    return
+
+reg_remaining_ternary_false@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:758
+    // else UInt64(0)
+    intc_0 // 0
+    b reg_remaining_ternary_merge@10
+
+reg_remaining_else_body@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:751
+    // legacy_reg, legacy_reg_exists = op.AppGlobal.get_ex_uint64(0, b"reg_state")
+    intc_0 // 0
+    bytec 9 // 0x7265675f7374617465
+    app_global_get_ex
+    swap
+    bury 5
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:752
+    // if legacy_reg_exists and legacy_reg // GLOBAL_COUNTER_RADIX == today:
+    bz reg_remaining_after_if_else@7
+    dig 3
+    intc_3 // 64
+    /
+    dig 3
+    ==
+    bz reg_remaining_after_if_else@7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:753
+    // registration_used = legacy_reg % GLOBAL_COUNTER_RADIX
+    dig 3
+    intc_3 // 64
+    %
+    bury 1
+    b reg_remaining_after_if_else@7
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.start_process[routing]() -> void:
+start_process:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:762-763
+    // # ============ TWO-PARTY PROCESSES ============
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    cover 2
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // invalid number of bytes for arc4.static_array<arc4.uint8, 32>
+    txna ApplicationArgs 3
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 4
+    dup
+    len
+    pushint 8
+    ==
+    assert // invalid number of bytes for arc4.uint64
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:771
+    // process_id_bytes = process_id.native.bytes
+    uncover 3
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:772
+    // initial_state_bytes = initial_state.native.bytes
+    uncover 2
+    extract 2 0
+    dup
+    cover 2
+    cover 4
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:773
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    dup
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:774
+    // assert process_id_bytes.length <= 62, "Process ID too long"
+    pushint 62
+    <=
+    assert // Process ID too long
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:775
+    // assert initial_state_bytes.length <= MAX_PROCESS_STATE, "State exceeds safe 943-byte limit"
+    swap
+    len
+    pushint 943
+    <=
+    assert // State exceeds safe 943-byte limit
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:776
+    // assert other_party.native != Global.zero_address, "Other party cannot be zero address"
+    dig 2
+    global ZeroAddress
+    !=
+    assert // Other party cannot be zero address
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:777
+    // assert other_party.native != Txn.sender, "Process requires two distinct parties"
+    txn Sender
+    uncover 3
+    !=
+    assert // Process requires two distinct parties
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:779
+    // box_key = b"p:" + process_id_bytes
+    bytec 4 // 0x703a
+    swap
+    concat
+    dup
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:781
+    // assert not box, "Process already exists"
+    box_len
+    bury 1
+    !
+    assert // Process already exists
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:782
+    // timeout_round = Global.round + timeout_rounds.native if timeout_rounds.native > 0 else UInt64(0)
+    btoi
+    dup
+    bz start_process_ternary_false@3
+    global Round
+    dig 1
+    +
+
+start_process_ternary_merge@4:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:784
+    // Txn.sender.bytes
+    txn Sender
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:784-785
+    // Txn.sender.bytes
+    // + other_party.native.bytes
+    dig 5
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:786
+    // + op.itob(0)
+    intc_0 // 0
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:784-786
+    // Txn.sender.bytes
+    // + other_party.native.bytes
+    // + op.itob(0)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:787
+    // + b"\x00"
+    bytec 6 // 0x00
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:784-787
+    // Txn.sender.bytes
+    // + other_party.native.bytes
+    // + op.itob(0)
+    // + b"\x00"
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:788
+    // + op.itob(timeout_round)
+    swap
+    itob
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:784-788
+    // Txn.sender.bytes
+    // + other_party.native.bytes
+    // + op.itob(0)
+    // + b"\x00"
+    // + op.itob(timeout_round)
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:784-789
+    // Txn.sender.bytes
+    // + other_party.native.bytes
+    // + op.itob(0)
+    // + b"\x00"
+    // + op.itob(timeout_round)
+    // + initial_state_bytes
+    dig 3
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:791
+    // total_size = box_key.length + new_content.length
+    dig 2
+    dup
+    cover 2
+    len
+    dig 1
+    len
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:792
+    // self._verify_mbr_payment(BOX_FLAT_MBR + (BOX_BYTE_MBR * total_size))
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    callsub _verify_mbr_payment
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:793
+    // box.put(new_content)
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:762-763
+    // # ============ TWO-PARTY PROCESSES ============
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 5
+    concat
+    log
+    intc_1 // 1
+    return
+
+start_process_ternary_false@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:782
+    // timeout_round = Global.round + timeout_rounds.native if timeout_rounds.native > 0 else UInt64(0)
+    intc_0 // 0
+    b start_process_ternary_merge@4
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.update_process[routing]() -> void:
+update_process:
+    intc_0 // 0
+    bytec_2 // ""
+    dupn 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:796
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dupn 2
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    txna ApplicationArgs 2
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:798
+    // process_id_bytes = process_id.native.bytes
+    swap
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:799
+    // new_state_bytes = new_state.native.bytes
+    swap
+    extract 2 0
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:800
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:801
+    // assert new_state_bytes.length <= MAX_PROCESS_STATE, "State exceeds safe 943-byte limit"
+    swap
+    len
+    pushint 943
+    <=
+    assert // State exceeds safe 943-byte limit
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:803
+    // box_key = b"p:" + process_id_bytes
+    bytec 4 // 0x703a
+    swap
+    concat
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:805
+    // old_value, exists = box.maybe()
+    box_get
+    swap
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:806
+    // assert exists, "Process does not exist"
+    assert // Process does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:807
+    // assert old_value.length >= 81, "Corrupted process box"
+    dup
+    len
+    dup
+    cover 2
+    dup
+    pushint 81
+    >=
+    assert // Corrupted process box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:809
+    // p1 = Account(old_value[:32])
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    dup
+    cover 4
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:810
+    // p2 = Account(old_value[32:64])
+    intc_3 // 64
+    dig 3
+    >=
+    intc_3 // 64
+    uncover 4
+    uncover 2
+    select
+    dup
+    cover 4
+    uncover 3
+    uncover 3
+    uncover 2
+    substring3
+    dup
+    cover 2
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:811
+    // assert Txn.sender == p1 or Txn.sender == p2, "Caller is not a participant"
+    txn Sender
+    ==
+    bnz update_process_bool_true@3
+    txn Sender
+    dig 1
+    ==
+    bz update_process_bool_false@4
+
+update_process_bool_true@3:
+    intc_1 // 1
+
+update_process_bool_merge@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:811
+    // assert Txn.sender == p1 or Txn.sender == p2, "Caller is not a participant"
+    assert // Caller is not a participant
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:812
+    // assert old_value[72:73] == b"\x00", "Cannot update finalized process"
+    pushint 72
+    dig 4
+    dup
+    cover 2
+    >=
+    pushint 72
+    dig 2
+    uncover 2
+    select
+    dup
+    cover 2
+    bury 14
+    pushint 73
+    dig 1
+    >=
+    pushint 73
+    dig 2
+    uncover 2
+    select
+    dig 7
+    dup
+    cover 4
+    uncover 3
+    dig 2
+    substring3
+    bytec 6 // 0x00
+    ==
+    assert // Cannot update finalized process
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:813
+    // timeout_round = op.btoi(old_value[73:81])
+    pushint 81
+    dig 2
+    >=
+    pushint 81
+    uncover 3
+    uncover 2
+    select
+    dup
+    bury 14
+    substring3
+    btoi
+    dup
+    bury 10
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:814
+    // if timeout_round > 0:
+    bz update_process_after_if_else@7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:815
+    // assert Global.round < timeout_round, "Process timed out"
+    global Round
+    dig 9
+    <
+    assert // Process timed out
+
+update_process_after_if_else@7:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:817
+    // new_turn = op.btoi(old_value[64:72]) + 1
+    dig 4
+    dup
+    dig 3
+    dig 14
+    dup
+    cover 3
+    substring3
+    btoi
+    intc_1 // 1
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:818
+    // new_content = p1.bytes + p2.bytes + op.itob(new_turn) + old_value[72:81] + new_state_bytes
+    dig 5
+    dig 4
+    concat
+    swap
+    itob
+    concat
+    cover 2
+    dig 13
+    substring3
+    concat
+    dig 7
+    concat
+    dup
+    bury 14
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:820
+    // new_size = new_content.length
+    len
+    dup
+    bury 11
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:821
+    // if new_size > old_size:
+    dig 4
+    >
+    bz update_process_else_body@9
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:822
+    // self._verify_process_growth_payment(BOX_BYTE_MBR * (new_size - old_size), p1)
+    dig 9
+    dup
+    dig 5
+    -
+    intc 4 // 400
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:134
+    // assert Txn.group_index > 0, "MBR payment transaction required"
+    txn GroupIndex
+    assert // MBR payment transaction required
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:135
+    // pay = gtxn.PaymentTransaction(Txn.group_index - 1)
+    txn GroupIndex
+    intc_1 // 1
+    -
+    dup
+    gtxns TypeEnum
+    intc_1 // pay
+    ==
+    assert // transaction type is pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:136
+    // assert pay.sender == payer, "Process growth must be funded by process owner"
+    dup
+    gtxns Sender
+    dig 6
+    ==
+    assert // Process growth must be funded by process owner
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:137
+    // assert pay.rekey_to == Global.zero_address, "Payment cannot rekey"
+    dup
+    gtxns RekeyTo
+    global ZeroAddress
+    ==
+    assert // Payment cannot rekey
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:138
+    // assert pay.close_remainder_to == Global.zero_address, "Payment cannot close account"
+    dup
+    gtxns CloseRemainderTo
+    global ZeroAddress
+    ==
+    assert // Payment cannot close account
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:139
+    // assert pay.receiver == Global.current_application_address, "MBR must be sent to app"
+    dup
+    gtxns Receiver
+    global CurrentApplicationAddress
+    ==
+    assert // MBR must be sent to app
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:140
+    // assert pay.amount == amount_needed, "MBR payment must be exact"
+    gtxns Amount
+    ==
+    assert // MBR payment must be exact
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:823
+    // box.resize(new_size)
+    dig 6
+    swap
+    box_resize
+
+update_process_after_if_else@12:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:828
+    // box.put(new_content)
+    dig 5
+    dig 13
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:796
+    // @arc4.abimethod
+    bytec_1 // 0x151f7c75
+    dig 8
+    concat
+    log
+    intc_1 // 1
+    return
+
+update_process_else_body@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:824
+    // elif new_size < old_size:
+    dig 9
+    dig 4
+    <
+    bz update_process_after_if_else@12
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:825
+    // released = BOX_BYTE_MBR * (old_size - new_size)
+    dig 3
+    dig 10
+    dup
+    cover 2
+    -
+    intc 4 // 400
+    *
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:826
+    // box.resize(new_size)
+    dig 7
+    uncover 2
+    box_resize
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:827
+    // self._pay(p1, released)
+    dig 3
+    swap
+    callsub _pay
+    b update_process_after_if_else@12
+
+update_process_bool_false@4:
+    intc_0 // 0
+    b update_process_bool_merge@5
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.resign_process[routing]() -> void:
+resign_process:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:831
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:833
+    // process_id_bytes = process_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:834
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:835
+    // box = BoxRef(key=b"p:" + process_id_bytes)
+    bytec 4 // 0x703a
+    swap
+    concat
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:836
+    // old_value, exists = box.maybe()
+    box_get
+    swap
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:837
+    // assert exists, "Process does not exist"
+    assert // Process does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:838
+    // assert old_value.length >= 81, "Corrupted process box"
+    dup
+    len
+    dup
+    cover 2
+    dup
+    pushint 81
+    >=
+    assert // Corrupted process box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:839
+    // p1 = Account(old_value[:32])
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:840
+    // p2 = Account(old_value[32:64])
+    intc_3 // 64
+    dig 3
+    >=
+    intc_3 // 64
+    uncover 4
+    uncover 2
+    select
+    uncover 3
+    uncover 3
+    uncover 2
+    substring3
+    dup
+    cover 2
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:841
+    // assert Txn.sender == p1 or Txn.sender == p2, "Caller is not a participant"
+    txn Sender
+    ==
+    bnz resign_process_bool_true@3
+    txn Sender
+    dig 1
+    ==
+    bz resign_process_bool_false@4
+
+resign_process_bool_true@3:
+    intc_1 // 1
+
+resign_process_bool_merge@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:841
+    // assert Txn.sender == p1 or Txn.sender == p2, "Caller is not a participant"
+    assert // Caller is not a participant
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:842
+    // assert old_value[72:73] == b"\x00", "Process already finalized"
+    pushint 72
+    dig 2
+    dup
+    cover 2
+    >=
+    pushint 72
+    dig 2
+    uncover 2
+    select
+    pushint 73
+    dig 2
+    >=
+    pushint 73
+    dig 3
+    uncover 2
+    select
+    dig 5
+    dup
+    cover 3
+    dig 2
+    dig 2
+    substring3
+    bytec 6 // 0x00
+    ==
+    assert // Process already finalized
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:843
+    // box.put(old_value[:72] + b"\x01" + old_value[73:])
+    dig 2
+    intc_0 // 0
+    uncover 3
+    substring3
+    pushbytes 0x01
+    concat
+    cover 2
+    uncover 3
+    substring3
+    concat
+    dig 4
+    swap
+    box_put
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:831
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+resign_process_bool_false@4:
+    intc_0 // 0
+    b resign_process_bool_merge@5
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.load_process[routing]() -> void:
+load_process:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:845
+    // @arc4.abimethod(readonly=True)
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:847
+    // process_id_bytes = process_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:848
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:849
+    // box = BoxRef(key=b"p:" + process_id_bytes)
+    bytec 4 // 0x703a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:850
+    // value, exists = box.maybe()
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:851
+    // assert exists, "Process does not exist"
+    assert // Process does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:852
+    // assert value.length >= 81, "Corrupted process box"
+    dup
+    len
+    dup
+    pushint 81
+    >=
+    assert // Corrupted process box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:853
+    // assert value.length <= 81 + MAX_PROCESS_STATE, "Legacy process is too large for ARC-4 return"
+    dup
+    pushint 1024
+    <=
+    assert // Legacy process is too large for ARC-4 return
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:854
+    // return arc4.String.from_bytes(value[81:])
+    pushint 81
+    dig 1
+    >=
+    pushint 81
+    dig 2
+    uncover 2
+    select
+    swap
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:845
+    // @arc4.abimethod(readonly=True)
+    bytec_1 // 0x151f7c75
+    swap
+    concat
+    log
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.get_process_info[routing]() -> void:
+get_process_info:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:856
+    // @arc4.abimethod(readonly=True)
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:860
+    // process_id_bytes = process_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:861
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:862
+    // box = BoxRef(key=b"p:" + process_id_bytes)
+    bytec 4 // 0x703a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:863
+    // value, exists = box.maybe()
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:864
+    // assert exists, "Process does not exist"
+    assert // Process does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:865
+    // assert value.length >= 81, "Corrupted process box"
+    dup
+    len
+    dup
+    pushint 81
+    >=
+    assert // Corrupted process box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:866
+    // p1 = arc4.Address.from_bytes(value[:32])
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:867
+    // p2 = arc4.Address.from_bytes(value[32:64])
+    intc_3 // 64
+    dig 3
+    >=
+    intc_3 // 64
+    dig 4
+    uncover 2
+    select
+    dig 4
+    uncover 3
+    dig 2
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:868
+    // turn = arc4.UInt64.from_bytes(value[64:72])
+    pushint 72
+    dig 4
+    >=
+    pushint 72
+    dig 5
+    uncover 2
+    select
+    dig 5
+    uncover 3
+    dig 2
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:869
+    // is_finalized = arc4.Bool(value[72:73] != b"\x00")
+    pushint 73
+    dig 5
+    >=
+    pushint 73
+    dig 6
+    uncover 2
+    select
+    dig 6
+    uncover 3
+    dig 2
+    substring3
+    bytec 6 // 0x00
+    !=
+    bytec 6 // 0x00
+    intc_0 // 0
+    uncover 2
+    setbit
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:870
+    // timeout_round = arc4.UInt64.from_bytes(value[73:81])
+    pushint 81
+    dig 6
+    >=
+    pushint 81
+    uncover 7
+    uncover 2
+    select
+    uncover 6
+    uncover 3
+    uncover 2
+    substring3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:856
+    // @arc4.abimethod(readonly=True)
+    uncover 4
+    uncover 4
+    concat
+    uncover 3
+    concat
+    uncover 2
+    concat
+    swap
+    concat
+    bytec_1 // 0x151f7c75
+    swap
+    concat
+    log
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.delete_process[routing]() -> void:
+delete_process:
+    bytec_2 // ""
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:873
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:875
+    // process_id_bytes = process_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:876
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:877
+    // box_key = b"p:" + process_id_bytes
+    bytec 4 // 0x703a
+    swap
+    concat
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:879
+    // value, exists = box.maybe()
+    box_get
+    swap
+    dup
+    uncover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:880
+    // assert exists, "Process does not exist"
+    assert // Process does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:881
+    // assert value.length >= 81, "Corrupted process box"
+    dup
+    len
+    dup
+    cover 2
+    dup
+    pushint 81
+    >=
+    assert // Corrupted process box
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:882
+    // p1 = Account(value[:32])
+    intc_2 // 32
+    dig 1
+    >=
+    intc_2 // 32
+    dig 2
+    uncover 2
+    select
+    dig 2
+    intc_0 // 0
+    dig 2
+    substring3
+    dup
+    cover 4
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:883
+    // p2 = Account(value[32:64])
+    intc_3 // 64
+    dig 3
+    >=
+    intc_3 // 64
+    uncover 4
+    uncover 2
+    select
+    uncover 3
+    uncover 3
+    uncover 2
+    substring3
+    dup
+    cover 2
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:884
+    // assert Txn.sender == p1 or Txn.sender == p2, "Caller is not a participant"
+    txn Sender
+    ==
+    bnz delete_process_bool_true@3
+    txn Sender
+    dig 1
+    ==
+    bz delete_process_bool_false@4
+
+delete_process_bool_true@3:
+    intc_1 // 1
+
+delete_process_bool_merge@5:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:884
+    // assert Txn.sender == p1 or Txn.sender == p2, "Caller is not a participant"
+    assert // Caller is not a participant
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:885
+    // is_finalized = value[72:73] == b"\x01"
+    pushint 72
+    dig 3
+    dup
+    cover 2
+    >=
+    pushint 72
+    dig 2
+    uncover 2
+    select
+    pushint 73
+    dig 2
+    >=
+    pushint 73
+    dig 3
+    uncover 2
+    select
+    dig 6
+    dup
+    cover 4
+    uncover 2
+    dig 2
+    substring3
+    pushbytes 0x01
+    ==
+    bury 10
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:886
+    // timeout_round = op.btoi(value[73:81])
+    pushint 81
+    dig 2
+    >=
+    pushint 81
+    uncover 3
+    uncover 2
+    select
+    substring3
+    btoi
+    dup
+    bury 7
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:887
+    // is_timed_out = timeout_round > 0 and Global.round >= timeout_round
+    bz delete_process_bool_false@8
+    global Round
+    dig 6
+    >=
+    bz delete_process_bool_false@8
+    intc_1 // 1
+
+delete_process_bool_merge@9:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:888
+    // assert is_finalized or is_timed_out, "Can only delete finalized or timed out processes"
+    dig 7
+    ||
+    assert // Can only delete finalized or timed out processes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:889
+    // total_size = box_key.length + value.length
+    dig 4
+    dup
+    len
+    dig 4
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:890
+    // assert box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    dig 2
+    swap
+    callsub _pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:873
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+delete_process_bool_false@8:
+    intc_0 // 0
+    b delete_process_bool_merge@9
+
+delete_process_bool_false@4:
+    intc_0 // 0
+    b delete_process_bool_merge@5
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.admin_delete_entity[routing]() -> void:
+admin_delete_entity:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:893-894
+    // # ============ CREATOR MODERATION ============
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:896
+    // assert Txn.sender == Global.creator_address, "Only creator can moderate"
+    txn Sender
+    global CreatorAddress
+    ==
+    assert // Only creator can moderate
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:897
+    // entity_id_bytes = entity_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:898
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:899
+    // box_key = b"e:" + entity_id_bytes
+    bytec 5 // 0x653a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:901
+    // value, exists = box.maybe()
+    dup
+    box_get
+    swap
+    dup
+    cover 3
+    cover 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:902
+    // assert exists, "Entity does not exist"
+    assert // Entity does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:903
+    // total_size = box_key.length + value.length
+    dup
+    len
+    uncover 2
+    len
+    dup
+    cover 3
+    swap
+    dig 1
+    +
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:904
+    // assert box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:905
+    // if value.length >= 32:
+    intc_2 // 32
+    >=
+    bz admin_delete_entity_else_body@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:906
+    // self._refund_full_box_mbr(Account(value[:32]), total_size)
+    intc_2 // 32
+    dig 2
+    dup
+    cover 2
+    >=
+    intc_2 // 32
+    cover 2
+    select
+    dig 3
+    intc_0 // 0
+    uncover 2
+    substring3
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    uncover 2
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+
+admin_delete_entity_after_if_else@4:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:893-894
+    // # ============ CREATOR MODERATION ============
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+admin_delete_entity_else_body@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:908
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:909
+    // self._refund_full_box_mbr(Account(self.escrow), total_size)
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    uncover 2
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+    b admin_delete_entity_after_if_else@4
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.admin_delete_process[routing]() -> void:
+admin_delete_process:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:911
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:913
+    // assert Txn.sender == Global.creator_address, "Only creator can moderate"
+    txn Sender
+    global CreatorAddress
+    ==
+    assert // Only creator can moderate
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:914
+    // process_id_bytes = process_id.native.bytes
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:915
+    // assert process_id_bytes.length > 0, "Process ID cannot be empty"
+    dup
+    len
+    assert // Process ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:916
+    // box_key = b"p:" + process_id_bytes
+    bytec 4 // 0x703a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:918
+    // value, exists = box.maybe()
+    dup
+    box_get
+    swap
+    dup
+    cover 3
+    cover 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:919
+    // assert exists, "Process does not exist"
+    assert // Process does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:920
+    // total_size = box_key.length + value.length
+    dup
+    len
+    uncover 2
+    len
+    dup
+    cover 3
+    swap
+    dig 1
+    +
+    cover 2
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:921
+    // assert box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:922
+    // if value.length >= 32:
+    intc_2 // 32
+    >=
+    bz admin_delete_process_else_body@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:923
+    // self._refund_full_box_mbr(Account(value[:32]), total_size)
+    intc_2 // 32
+    dig 2
+    dup
+    cover 2
+    >=
+    intc_2 // 32
+    cover 2
+    select
+    dig 3
+    intc_0 // 0
+    uncover 2
+    substring3
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    uncover 2
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+
+admin_delete_process_after_if_else@4:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:911
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+admin_delete_process_else_body@3:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:925
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:926
+    // self._refund_full_box_mbr(Account(self.escrow), total_size)
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    uncover 2
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+    b admin_delete_process_after_if_else@4
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine.admin_delete_sponsored[routing]() -> void:
+admin_delete_sponsored:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:928
+    // @arc4.abimethod
+    txna ApplicationArgs 1
+    dup
+    intc_0 // 0
+    extract_uint16 // on error: invalid array length header
+    pushint 2
+    +
+    dig 1
+    len
+    ==
+    assert // invalid number of bytes for arc4.dynamic_array<arc4.uint8>
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:930
+    // assert Txn.sender == Global.creator_address, "Only creator can moderate"
+    txn Sender
+    global CreatorAddress
+    ==
+    assert // Only creator can moderate
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:931
+    // assert self.escrow != Global.zero_address.bytes, "Escrow not configured"
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    global ZeroAddress
+    !=
+    assert // Escrow not configured
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:932
+    // entity_id_bytes = entity_id.native.bytes
+    swap
+    extract 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:933
+    // assert entity_id_bytes.length > 0, "Entity ID cannot be empty"
+    dup
+    len
+    assert // Entity ID cannot be empty
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:934
+    // box_key = b"s:" + entity_id_bytes
+    bytec 7 // 0x733a
+    swap
+    concat
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:936
+    // value, exists = box.maybe()
+    dup
+    box_get
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:937
+    // assert exists, "Sponsored entity does not exist"
+    assert // Sponsored entity does not exist
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:938
+    // total_size = box_key.length + value.length
+    dig 1
+    len
+    swap
+    len
+    +
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:939
+    // assert box.delete()
+    swap
+    box_del
+    assert
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:940
+    // self._refund_full_box_mbr(Account(self.escrow), total_size)
+    dig 1
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:160
+    // self._pay(recipient, BOX_FLAT_MBR + (BOX_BYTE_MBR * total_bytes))
+    intc 4 // 400
+    *
+    intc 5 // 2500
+    +
+    callsub _pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:928
+    // @arc4.abimethod
+    intc_1 // 1
+    return
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine._verify_mbr_payment(amount_needed: uint64) -> void:
+_verify_mbr_payment:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:121-123
+    // # ============ MBR HELPERS ============
+    // @subroutine
+    // def _verify_mbr_payment(self, amount_needed: UInt64) -> None:
+    proto 1 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:124
+    // assert Txn.group_index > 0, "MBR payment transaction required"
+    txn GroupIndex
+    assert // MBR payment transaction required
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:125
+    // pay = gtxn.PaymentTransaction(Txn.group_index - 1)
+    txn GroupIndex
+    intc_1 // 1
+    -
+    dup
+    gtxns TypeEnum
+    intc_1 // pay
+    ==
+    assert // transaction type is pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:126
+    // assert pay.sender == Txn.sender, "Payment must come from caller"
+    dup
+    gtxns Sender
+    txn Sender
+    ==
+    assert // Payment must come from caller
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:127
+    // assert pay.rekey_to == Global.zero_address, "Payment cannot rekey"
+    dup
+    gtxns RekeyTo
+    global ZeroAddress
+    ==
+    assert // Payment cannot rekey
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:128
+    // assert pay.close_remainder_to == Global.zero_address, "Payment cannot close account"
+    dup
+    gtxns CloseRemainderTo
+    global ZeroAddress
+    ==
+    assert // Payment cannot close account
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:129
+    // assert pay.receiver == Global.current_application_address, "MBR must be sent to app"
+    dup
+    gtxns Receiver
+    global CurrentApplicationAddress
+    ==
+    assert // MBR must be sent to app
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:130
+    // assert pay.amount == amount_needed, "MBR payment must be exact"
+    gtxns Amount
+    frame_dig -1
+    ==
+    assert // MBR payment must be exact
+    retsub
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine._verify_sponsor_payment(amount_needed: uint64) -> void:
+_verify_sponsor_payment:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:142-143
+    // @subroutine
+    // def _verify_sponsor_payment(self, amount_needed: UInt64) -> None:
+    proto 1 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:144
+    // assert Txn.group_index > 0, "Sponsor MBR payment required"
+    txn GroupIndex
+    assert // Sponsor MBR payment required
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:145
+    // pay = gtxn.PaymentTransaction(Txn.group_index - 1)
+    txn GroupIndex
+    intc_1 // 1
+    -
+    dup
+    gtxns TypeEnum
+    intc_1 // pay
+    ==
+    assert // transaction type is pay
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:146
+    // assert pay.rekey_to == Global.zero_address, "Sponsor payment cannot rekey"
+    dup
+    gtxns RekeyTo
+    global ZeroAddress
+    ==
+    assert // Sponsor payment cannot rekey
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:147
+    // assert pay.close_remainder_to == Global.zero_address, "Sponsor payment cannot close"
+    dup
+    gtxns CloseRemainderTo
+    global ZeroAddress
+    ==
+    assert // Sponsor payment cannot close
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:148
+    // assert pay.receiver == Global.current_application_address, "Sponsor MBR must be sent to app"
+    dup
+    gtxns Receiver
+    global CurrentApplicationAddress
+    ==
+    assert // Sponsor MBR must be sent to app
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:149
+    // assert pay.amount == amount_needed, "Sponsor MBR payment must be exact"
+    dup
+    gtxns Amount
+    frame_dig -1
+    ==
+    assert // Sponsor MBR payment must be exact
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:150
+    // assert pay.sender == Account(self.escrow), "Sponsor payment must come from escrow"
+    gtxns Sender
+    intc_0 // 0
+    bytec_0 // "escrow"
+    app_global_get_ex
+    assert // check self.escrow exists
+    dup
+    len
+    intc_2 // 32
+    ==
+    assert // Address length is 32 bytes
+    ==
+    assert // Sponsor payment must come from escrow
+    retsub
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine._pay(recipient: bytes, amount: uint64) -> void:
+_pay:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:152-153
+    // @subroutine
+    // def _pay(self, recipient: Account, amount: UInt64) -> None:
+    proto 2 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:154
+    // if amount > 0:
+    frame_dig -1
+    bz _pay_after_if_else@3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:155-156
+    // # The caller/group must pool the fee for this inner transaction.
+    // itxn.Payment(receiver=recipient, amount=amount, fee=0).submit()
+    itxn_begin
+    frame_dig -1
+    itxn_field Amount
+    frame_dig -2
+    itxn_field Receiver
+    intc_1 // pay
+    itxn_field TypeEnum
+    intc_0 // 0
+    itxn_field Fee
+    itxn_submit
+
+_pay_after_if_else@3:
+    retsub
+
+
+// UniversalStateMachine_v5_8_2.UniversalStateMachine._validate_agent_name(name: bytes) -> void:
+_validate_agent_name:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:162-163
+    // @subroutine
+    // def _validate_agent_name(self, name: Bytes) -> None:
+    proto 1 0
+    bytec_2 // ""
+    dupn 3
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:164
+    // assert name.length >= 10, "Display name too short"
+    frame_dig -1
+    len
+    dupn 2
+    pushint 10
+    >=
+    assert // Display name too short
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:165
+    // assert name.length <= MAX_AGENT_DISPLAY_NAME, "Display name too long (max 41 bytes)"
+    dup
+    pushint 41
+    <=
+    assert // Display name too long (max 41 bytes)
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:166
+    // split_at = name.length - 9
+    pushint 9
+    -
+    dup
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:167
+    // assert name[split_at] == b"_", "Display name must end with _XXXXXXXX"
+    frame_dig -1
+    swap
+    intc_1 // 1
+    extract3
+    pushbytes 0x5f
+    ==
+    assert // Display name must end with _XXXXXXXX
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:169
+    // i = UInt64(0)
+    intc_0 // 0
+
+_validate_agent_name_while_top@1:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:170
+    // while i < split_at:
+    frame_dig 6
+    frame_dig 5
+    <
+    bz _validate_agent_name_after_while@20
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:171
+    // ch = op.btoi(name[i])
+    frame_dig -1
+    frame_dig 6
+    getbyte
+    dup
+    frame_bury 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:172
+    // is_digit = ch >= 48 and ch <= 57
+    pushint 48
+    >=
+    bz _validate_agent_name_bool_false@5
+    frame_dig 0
+    pushint 57
+    <=
+    bz _validate_agent_name_bool_false@5
+    intc_1 // 1
+    frame_bury 1
+
+_validate_agent_name_bool_merge@6:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:173
+    // is_upper = ch >= 65 and ch <= 90
+    frame_dig 0
+    pushint 65
+    >=
+    bz _validate_agent_name_bool_false@9
+    frame_dig 0
+    pushint 90
+    <=
+    bz _validate_agent_name_bool_false@9
+    intc_1 // 1
+    frame_bury 3
+
+_validate_agent_name_bool_merge@10:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:174
+    // is_lower = ch >= 97 and ch <= 122
+    frame_dig 0
+    pushint 97
+    >=
+    bz _validate_agent_name_bool_false@13
+    frame_dig 0
+    pushint 122
+    <=
+    bz _validate_agent_name_bool_false@13
+    intc_1 // 1
+    frame_bury 2
+
+_validate_agent_name_bool_merge@14:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:175
+    // assert is_digit or is_upper or is_lower, "Base name must be ASCII letters or digits"
+    frame_dig 1
+    bnz _validate_agent_name_bool_true@17
+    frame_dig 3
+    bnz _validate_agent_name_bool_true@17
+    frame_dig 2
+    bz _validate_agent_name_bool_false@18
+
+_validate_agent_name_bool_true@17:
+    intc_1 // 1
+
+_validate_agent_name_bool_merge@19:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:175
+    // assert is_digit or is_upper or is_lower, "Base name must be ASCII letters or digits"
+    assert // Base name must be ASCII letters or digits
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:176
+    // i += 1
+    frame_dig 6
+    intc_1 // 1
+    +
+    frame_bury 6
+    b _validate_agent_name_while_top@1
+
+_validate_agent_name_bool_false@18:
+    intc_0 // 0
+    b _validate_agent_name_bool_merge@19
+
+_validate_agent_name_bool_false@13:
+    intc_0 // 0
+    frame_bury 2
+    b _validate_agent_name_bool_merge@14
+
+_validate_agent_name_bool_false@9:
+    intc_0 // 0
+    frame_bury 3
+    b _validate_agent_name_bool_merge@10
+
+_validate_agent_name_bool_false@5:
+    intc_0 // 0
+    frame_bury 1
+    b _validate_agent_name_bool_merge@6
+
+_validate_agent_name_after_while@20:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:178
+    // i = split_at + 1
+    frame_dig 5
+    intc_1 // 1
+    +
+    frame_bury 6
+
+_validate_agent_name_while_top@21:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:179
+    // while i < name.length:
+    frame_dig 6
+    frame_dig 4
+    <
+    bz _validate_agent_name_after_while@31
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:180
+    // ch = op.btoi(name[i])
+    frame_dig -1
+    frame_dig 6
+    getbyte
+    dup
+    frame_bury 0
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:181
+    // is_upper = ch >= 65 and ch <= 90
+    pushint 65
+    >=
+    bz _validate_agent_name_bool_false@25
+    frame_dig 0
+    pushint 90
+    <=
+    bz _validate_agent_name_bool_false@25
+    intc_1 // 1
+    frame_bury 3
+
+_validate_agent_name_bool_merge@26:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:182
+    // is_base32_digit = ch >= 50 and ch <= 55
+    frame_dig 0
+    pushint 50
+    >=
+    bz _validate_agent_name_bool_false@29
+    frame_dig 0
+    pushint 55
+    <=
+    bz _validate_agent_name_bool_false@29
+    intc_1 // 1
+
+_validate_agent_name_bool_merge@30:
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:183
+    // assert is_upper or is_base32_digit, "Name suffix must use uppercase base32 characters"
+    frame_dig 3
+    ||
+    assert // Name suffix must use uppercase base32 characters
+    // mnt/data/sabha_v582_reviewed/UniversalStateMachine_v5_8_2.py:184
+    // i += 1
+    frame_dig 6
+    intc_1 // 1
+    +
+    frame_bury 6
+    b _validate_agent_name_while_top@21
+
+_validate_agent_name_bool_false@29:
+    intc_0 // 0
+    b _validate_agent_name_bool_merge@30
+
+_validate_agent_name_bool_false@25:
+    intc_0 // 0
+    frame_bury 3
+    b _validate_agent_name_bool_merge@26
+
+_validate_agent_name_after_while@31:
+    retsub
+</script>
+<script type="application/teal" id="clearTeal">#pragma version 11
+#pragma typetrack false
+
+// algopy.arc4.ARC4Contract.clear_state_program() -> uint64:
+main:
+    pushint 1
+    return
+</script>
+
+<script>
+(function(){
+  "use strict";
+  var SDK_PRIMARY  = "https://cdn.jsdelivr.net/npm/algosdk@2.9.0/dist/browser/algosdk.min.js";
+  var SDK_FALLBACK = "https://unpkg.com/algosdk@2.9.0/dist/browser/algosdk.min.js";
+  var ALGOD_FAILOVER = ["https://testnet-api.algonode.cloud","https://testnet-api.4160.nodely.dev","https://testnet-api.algonode.network"];
+  var APP_BALANCE_TARGET = 300000;
+  var ESCROW_MIN_BALANCE = 100000;
+  var FEE_BUFFER = 30000;
+  var GI=1, GB=1, LI=0, LB=0;
+  var SET_ESCROW = new Uint8Array([0x13,0x2c,0xea,0xfa]);
+  var SPONSORED_REGISTER = "0x9a06e2a2";
+  var SPONSORED_POST = "0xb155ccca";
+
+  var ESCROW_TEMPLATE =
+`#pragma version 10
+// Sabha v5.8.2 sponsor LogicSig — deterministic and app-bound.
+global GroupSize
+int 2
+==
+assert
+
+txn GroupIndex
+int 0
+==
+assert
+
+txn TypeEnum
+int pay
+==
+assert
+
+txn RekeyTo
+global ZeroAddress
+==
+assert
+
+txn CloseRemainderTo
+global ZeroAddress
+==
+assert
+
+txn Receiver
+addr APP_ADDRESS_VALUE
+==
+assert
+
+txn Amount
+int 0
+>
+assert
+
+txn Amount
+int 350000
+<=
+assert
+
+txn Fee
+int 15000
+<=
+assert
+
+gtxn 1 TypeEnum
+int appl
+==
+assert
+
+gtxn 1 ApplicationID
+int APP_ID_VALUE
+==
+assert
+
+gtxn 1 RekeyTo
+global ZeroAddress
+==
+assert
+
+gtxna 1 ApplicationArgs 0
+byte 0x9a06e2a2
+==
+gtxna 1 ApplicationArgs 0
+byte 0xb155ccca
+==
+||
+assert
+
+int 1`;
+
+  function $(id){return document.getElementById(id);}
+  function log(m,c){var d=document.createElement("div");if(c)d.className=c;d.textContent=m;$("out").appendChild(d);}
+  function b64ToBytes(b){var x=atob(b),u=new Uint8Array(x.length);for(var i=0;i<x.length;i++)u[i]=x.charCodeAt(i);return u;}
+  function bytesToB64(u){var x="";for(var i=0;i<u.length;i++)x+=String.fromCharCode(u[i]);return btoa(x);}
+  function tealFrom(id){
+    var input=$(id+"Input");
+    if(input&&input.value.trim())return input.value.trim();
+    var el=$(id);return el?el.textContent.trim():"";
+  }
+  function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+  function loadScript(url){return new Promise(function(res,rej){var t=document.createElement("script");t.src=url;t.onload=res;t.onerror=function(){rej(new Error("Could not load "+url));};document.head.appendChild(t);});}
+  async function ensureSdk(){if(window.algosdk)return;try{await loadScript(SDK_PRIMARY);}catch(_){await loadScript(SDK_FALLBACK);}if(!window.algosdk)throw new Error("algosdk failed to load");}
+  async function connect(){var prim=$("algod").value.trim(),list=[prim].concat(ALGOD_FAILOVER.filter(function(x){return x&&x!==prim;}));for(var i=0;i<list.length;i++){try{var c=new algosdk.Algodv2("",list[i],"");await c.status().do();return{c:c,url:list[i]};}catch(_){}}throw new Error("No TestNet algod endpoint reachable.");}
+  async function sendWait(c,signed){var r=await c.sendRawTransaction(signed).do(),id=r.txId||r.txid;await algosdk.waitForConfirmation(c,id,12);return id;}
+  async function compileTeal(c,t){var r=await c.compile(t).do();return{addr:r.hash,program:b64ToBytes(r.result)};}
+  function stateKey(addr,approvalTeal){return "sabha:v582:deploy:"+addr+":"+approvalTeal.length+":"+approvalTeal.slice(0,24);}
+  function loadState(key){try{return JSON.parse(localStorage.getItem(key)||"{}")||{};}catch(_){return{};}}
+  function saveState(key,st){localStorage.setItem(key,JSON.stringify(st));}
+  function clearMnemonic(){try{$("mn").value="";}catch(_){}}
+  async function accountInfo(c,addr){try{return await c.accountInformation(addr).do();}catch(_){return null;}}
+  function amountOf(info){return Number(info&&info.amount||0);}
+  function globalEscrow(app){
+    try{var gs=app.params["global-state"]||app.params.globalState||[];for(var i=0;i<gs.length;i++){if(atob(gs[i].key)==="escrow"){var b=gs[i].value.bytes||"";if(b){try{var u=b64ToBytes(b),allZero=(u.length===32);for(var z=0;z<u.length;z++){if(u[z]!==0){allZero=false;break;}}if(allZero)return "";}catch(_){}}return b;}}}catch(_){}return "";
+  }
+  async function verifyApp(c,id){try{return await c.getApplicationByID(Number(id)).do();}catch(_){return null;}}
+  function renderCfg(st){if(!st.appId||!st.escrowAddr||!st.escrowProgramB64)return;$("cfg").textContent='const APP_ID = '+st.appId+';\nconst ESCROW_ADDRESS = "'+st.escrowAddr+'";\nconst ESCROW_PROGRAM_B64 = "'+st.escrowProgramB64+'";';}
+
+  window.resetSavedDeployment=function(){
+    var mn=$("mn").value.trim().toLowerCase().replace(/\s+/g," ");
+    if(mn.split(" ").length!==25){alert("Paste the deployment mnemonic first so the correct saved record can be selected.");return;}
+    try{var a=algosdk.mnemonicToSecretKey(mn),t=tealFrom("approvalTeal");if(!t||t.indexOf("REGENERATE_FROM_REAL_PUYAPY_COMPILE")!==-1)throw new Error("Paste the same compiled approval TEAL used for this deployment before resetting its saved progress.");var k=stateKey(a.addr,t);if(confirm("Forget locally saved deployment progress for "+a.addr+"? This does not change the blockchain.")){localStorage.removeItem(k);$("cfg").textContent="// saved progress cleared";$("out").textContent="";}}catch(e){alert(e.message||e);}
+  };
+
+  window.deploy=async function(){
+    var btn=$("go");btn.disabled=true;btn.textContent="Working…";$("out").textContent="";
+    try{
+      await ensureSdk();
+      var mn=$("mn").value.trim().toLowerCase().replace(/\s+/g," ");
+      if(mn.split(" ").length!==25)throw new Error("Paste a valid 25-word Algorand mnemonic.");
+      var acct;try{acct=algosdk.mnemonicToSecretKey(mn);}catch(e){throw new Error("Invalid mnemonic: "+(e.message||e));}
+      var addr=acct.addr,sk=acct.sk,approvalTeal=tealFrom("approvalTeal"),clearTeal=tealFrom("clearTeal");
+      if(!approvalTeal||!clearTeal||approvalTeal.indexOf("REGENERATE_FROM_REAL_PUYAPY_COMPILE")!==-1||clearTeal.indexOf("REGENERATE_FROM_REAL_PUYAPY_COMPILE")!==-1)
+        throw new Error("Paste genuine PuyaPy-generated v5.8.2 approval and clear-state TEAL before deployment. Placeholder TEAL is intentionally non-deployable.");
+      var poolAlgo=Number($("pool").value);if(!isFinite(poolAlgo)||poolAlgo<0||poolAlgo>20)throw new Error("Sponsor pool must be between 0 and 20 ALGO.");
+      var poolSpendable=Math.round(poolAlgo*1e6),escrowTarget=ESCROW_MIN_BALANCE+poolSpendable;
+      var conn=await connect(),c=conn.c;log("algod: "+conn.url,"ok");log("Deployer: "+addr);
+      var key=stateKey(addr,approvalTeal),st=loadState(key);st.deployer=addr;st.network="testnet";
+
+      log("[preflight] Compiling supplied PuyaPy v5.8.2 TEAL…","step");
+      var approval=await compileTeal(c,approvalTeal),clear=await compileTeal(c,clearTeal),total=approval.program.length+clear.program.length;
+      var extraPages=Math.max(0,Math.ceil(total/2048)-1);if(extraPages>3)throw new Error("Programs require more than 3 extra pages.");
+      var appMbr=100000+100000*extraPages+28500*GI+50000*GB;
+      log(total+" compiled bytes · "+extraPages+" extra page(s) · creator reserve "+(appMbr/1e6).toFixed(3)+" ALGO");
+
+      if(st.appId){
+        var existing=await verifyApp(c,st.appId);
+        if(!existing){log("Saved App ID no longer exists; clearing stale local progress.","er");st={deployer:addr,network:"testnet"};saveState(key,st);}
+        else{st.appAddr=algosdk.getApplicationAddress(Number(st.appId)).toString();log("[1/5] Resuming App ID "+st.appId,"ok");}
+      }
+      if(!st.appId){
+        var info=await c.accountInformation(addr).do(),spend=Number(info.amount)-Number(info["min-balance"]!=null?info["min-balance"]:info.minBalance||100000);
+        var approximate=appMbr+APP_BALANCE_TARGET+escrowTarget+FEE_BUFFER;
+        if(spend<approximate)throw new Error("Insufficient spendable balance. Need approximately "+(approximate/1e6).toFixed(3)+" ALGO for the remaining deployment.");
+        log("[1/5] Creating application…","step");
+        var sp=await c.getTransactionParams().do();
+        var tx=algosdk.makeApplicationCreateTxnFromObject({from:addr,suggestedParams:sp,onComplete:algosdk.OnApplicationComplete.NoOpOC,approvalProgram:approval.program,clearProgram:clear.program,numGlobalInts:GI,numGlobalByteSlices:GB,numLocalInts:LI,numLocalByteSlices:LB,extraPages:extraPages});
+        var id=await sendWait(c,tx.signTxn(sk)),ptx=await c.pendingTransactionInformation(id).do();
+        st.appId=Number(ptx["application-index"]||ptx.applicationIndex);st.appAddr=algosdk.getApplicationAddress(st.appId).toString();st.createTx=id;saveState(key,st);log("App ID: "+st.appId,"ok");
+      }
+
+      log("[2/5] Ensuring app-account funding…","step");
+      var appInfo=await accountInfo(c,st.appAddr),appBal=amountOf(appInfo),appDelta=Math.max(0,APP_BALANCE_TARGET-appBal);
+      if(appDelta){var sp=await c.getTransactionParams().do();st.appFundTx=await sendWait(c,algosdk.makePaymentTxnWithSuggestedParamsFromObject({from:addr,to:st.appAddr,amount:appDelta,suggestedParams:sp}).signTxn(sk));saveState(key,st);}
+      log("App balance target satisfied.","ok");
+
+      log("[3/5] Compiling deterministic sponsor escrow…","step");
+      var etmpl=ESCROW_TEMPLATE.split("APP_ADDRESS_VALUE").join(st.appAddr).split("APP_ID_VALUE").join(String(st.appId));
+      var escrow=await compileTeal(c,etmpl),lsig=new algosdk.LogicSigAccount(escrow.program);
+      st.escrowAddr=lsig.address();st.escrowProgramB64=bytesToB64(escrow.program);saveState(key,st);log("Escrow: "+st.escrowAddr,"ok");
+
+      log("[4/5] Ensuring sponsor-pool funding…","step");
+      var escInfo=await accountInfo(c,st.escrowAddr),escBal=amountOf(escInfo),escDelta=Math.max(0,escrowTarget-escBal);
+      if(escDelta){var sp=await c.getTransactionParams().do();st.escrowFundTx=await sendWait(c,algosdk.makePaymentTxnWithSuggestedParamsFromObject({from:addr,to:st.escrowAddr,amount:escDelta,suggestedParams:sp}).signTxn(sk));saveState(key,st);}
+      log("Escrow balance: "+(Math.max(escBal,escrowTarget)/1e6).toFixed(3)+" ALGO (includes 0.100 account minimum).","ok");
+
+      log("[5/5] Finalizing: linking escrow and permanently disabling upgrades…","step");
+      var app=await verifyApp(c,st.appId),linked=globalEscrow(app);
+      var expectedB64=bytesToB64(algosdk.decodeAddress(st.escrowAddr).publicKey);
+      if(linked&&linked!==expectedB64)throw new Error("App is already finalized to a different escrow. Refusing to overwrite.");
+      if(!linked){var sp=await c.getTransactionParams().do(),setTxn=algosdk.makeApplicationNoOpTxnFromObject({from:addr,appIndex:st.appId,suggestedParams:sp,appArgs:[SET_ESCROW,algosdk.decodeAddress(st.escrowAddr).publicKey]});st.linkTx=await sendWait(c,setTxn.signTxn(sk));st.finalized=true;saveState(key,st);}
+      else st.finalized=true;
+      log("Deployment logic finalized and immutable; creator e:/s:/p: moderation remains available with full MBR refunds.","ok");renderCfg(st);clearMnemonic();
+      log("Done. Paste the three configuration lines into the hardened client.","ok");
+    }catch(e){log("Stopped safely: "+(e&&e.message?e.message:e),"er");log("Confirmed progress was saved locally. Fix the problem and press Deploy / Resume; it will not intentionally create a duplicate app.","step");}
+    btn.disabled=false;btn.textContent="Deploy / Resume on TestNet";
+  };
+
+  var ev=$("escrowView");if(ev)ev.textContent=ESCROW_TEMPLATE;
+  var _ai=$("approvalTealInput");if(_ai&&!_ai.value.trim()){var _ae=$("approvalTeal");if(_ae)_ai.value=_ae.textContent.trim();}
+  var _ci=$("clearTealInput");if(_ci&&!_ci.value.trim()){var _ce=$("clearTeal");if(_ce)_ci.value=_ce.textContent.trim();}
+})();
+</script>
+</body>
+</html>
