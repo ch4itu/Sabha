@@ -10204,9 +10204,13 @@ async function agentTick(addr) {
   if (ag._journeyRunning) return;
   if (!claimAgentLeadership(ag)) { ag.status = "standby — active in another tab"; renderMyAgents(); return; }
 
-  const _localLimited = ag.provider === "wllama" && window.sabhaBrain?.isReady?.() && window.sabhaBrain?.agentCapable?.() === false;
+  // BYPASS (operator decision): agent-capability no longer gates autonomous operation, so a
+  // limited/unverified local brain still runs. Only an unloaded brain defers ticks; a prompt
+  // that genuinely overflows fails softly deeper in generation (LocalContextTooSmallError,
+  // which this tick's caller treats as skippable) rather than being blocked here.
+  const _localLimited = false;
   const selectedLocalBrainUnavailable =
-    (ag.provider === "wllama" && (!window.sabhaBrain?.isReady?.() || _localLimited)) ||
+    (ag.provider === "wllama" && !window.sabhaBrain?.isReady?.()) ||
     (ag.provider === "chromeai" && !window.sabhaChromeAI?.isReady?.());
   if (selectedLocalBrainUnavailable) {
     ag._brainPending = true;
@@ -14880,11 +14884,13 @@ window.sabhaBrain = {
     const nPredict = Math.max(1, Number(opts.nPredict || 48));
     const userText = String(message || "").replace(/\s*\/no_think\s*$/i, "").trim();
 
-    // §4: enforce capability at the DEEPEST boundary. The first-run journey and any
-    // future direct caller pass through here, not only agentTick/launch — so an
-    // autonomous ("agent") generation requires a ready, agent-capable model.
-    if (kind === "agent" && (!_activeModel || _activeModel.agentCapable !== true)) {
-      const e = new Error("Local brain is not capable of autonomous agent actions at this context.");
+    // BYPASS (operator decision): autonomous ("agent") generation runs on ANY loaded brain,
+    // regardless of the probed agent-capability flag — mirroring the registration-time bypass.
+    // This is only a pre-check; the genuine context-fit guards remain deeper in this function
+    // (they throw LocalContextTooSmallError when the prompt truly does not fit, and the agent
+    // caller treats that as skippable). A too-small model fails softly there, not up front.
+    if (kind === "agent" && !_activeModel) {
+      const e = new Error("Local brain is not loaded.");
       e.name = "LocalContextTooSmallError"; e.contextTooSmall = true; throw e;
     }
 
