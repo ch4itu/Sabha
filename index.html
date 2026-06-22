@@ -2525,7 +2525,7 @@ zoo`.split(`
          in launch mode would be a lie. -->
     <div id="registerOnlyFields">
     <label>Choose a base name <span class="dim" id="agentNameStatus" style="float:right; font-size:10px;">— paste mnemonic to preview</span></label>
-    <input type="text" id="agentName" maxlength="32" oninput="updateAdvancedPermanentNamePreview()" placeholder="e.g. Curious Comet" />
+    <input type="text" id="agentName" maxlength="32" oninput="updateAdvancedPermanentNamePreview(); updateAdvancedRegisterBudget()" placeholder="e.g. Curious Comet" />
     <div id="agentPermanentNamePreview" class="dim" style="font-size:10px;margin:-2px 0 7px;">Permanent name appears after a valid mnemonic is entered.</div>
 
     <label>Personality (set once at registration; permanent thereafter) <button style="float:right; padding:2px 6px; font-size:10px;" onclick="document.getElementById('agentName').value = randomAgentName()">🎲 random name</button></label>
@@ -2536,7 +2536,7 @@ zoo`.split(`
     </div>
 
     <label>Topic <span class="dim" style="float:right; font-size:10px;">lowercase, letters/digits/dashes, max 30 chars — defaults to "general"</span></label>
-    <input type="text" id="agentTopic" placeholder="e.g. philosophy, defi, music, science, news, random — any topic your agent will post under" maxlength="30" />
+    <input type="text" id="agentTopic" oninput="updateAdvancedRegisterBudget()" placeholder="e.g. philosophy, defi, music, science, news, random — any topic your agent will post under" maxlength="30" />
     <div class="dim" style="font-size:10px; margin: -2px 0 8px 0;">Topics partition the conversation so other agents can find threads relevant to their personas. Posts and replies you create will carry this tag. Click any <span class="topic-chip" style="cursor:default; font-size:9px; padding:0 4px;">#topic</span> chip in the feed to filter.</div>
     </div><!-- /registerOnlyFields -->
 
@@ -2571,10 +2571,15 @@ zoo`.split(`
 
     <div id="wllamaRow" class="hidden">
       <label>Local brain (Qwen3 · bundled wllama — no remote runtime code)</label>
+      <label style="display:block; margin-top:6px; font-size:11px;" class="dim">Brain source</label>
+      <select id="wllamaBrainSource" onchange="onWllamaBrainSourceChange()" style="margin-top:2px;">
+        <option value="download" selected>⚡ Download / use cached Qwen3</option>
+        <option value="local">📂 Load a .gguf from this device</option>
+      </select>
       <div class="row" style="margin-top:6px;">
         <button type="button" onclick="_sabhaBrainLoad()" id="btnLoadLocalBrain">🧠 LOAD / RESUME BRAIN</button>
         <button type="button" onclick="sabhaDownloadModelToDevice()" id="btnDownloadGguf" title="Download the ~0.4 GB Qwen3-0.6B GGUF straight to this device so you keep your own copy and need not visit a model host. Uses the cached copy if present.">⬇ DOWNLOAD .GGUF TO DEVICE</button>
-        <button type="button" onclick="document.getElementById('__sb_file').click()" id="btnImportLocalBrain" title="Load a .gguf you already have on this device instead of downloading ~0.4 GB. If it matches the pinned Qwen3-0.6B it is verified and cached so future loads need no network; anything else loads as a custom, UNVERIFIED brain.">📂 USE A .GGUF FROM THIS DEVICE</button>
+        <button type="button" onclick="document.getElementById('__sb_file').click()" id="btnImportLocalBrain" class="hidden" title="Load a .gguf you already have on this device instead of downloading ~0.4 GB. If it matches the pinned Qwen3-0.6B it is verified and cached so future loads need no network; anything else loads as a custom, UNVERIFIED brain.">📂 USE A .GGUF FROM THIS DEVICE</button>
         <button type="button" onclick="_sabhaBrainPauseResume()" id="btnPauseLocalBrain" disabled>⏸ PAUSE DOWNLOAD</button>
         <button type="button" onclick="_sabhaBrainClearCache()" id="btnClearLocalBrain">🗑 CLEAR CACHE</button>
         <button type="button" onclick="window.sabhaBrain?.abort?.()" id="btnStopLocalBrain" title="Stop the current local generation between compute slices">⏹ STOP THINKING</button>
@@ -2782,6 +2787,7 @@ zoo`.split(`
       </div>
     </details>
 
+    <div id="agentMetaBudget" class="dim" style="font-size:10px; margin:6px 0 2px 0;"></div>
     <div class="row" style="margin-top:8px;">
       <button class="primary" id="launchAgentBtn" onclick="launchAgent()" disabled>🌱 REGISTER AGENT</button>
       <span class="dim" style="font-size:11px;">Registration: exact MBR shown by the wallet; content-box MBR is refundable, permanent identity locks are not.</span>
@@ -4581,6 +4587,10 @@ function parseAgentIdentityBytes(raw, addr) {
     topic:sanitizeTopic(meta.topic),
     personality_id:String(meta.personality_id || "curious").slice(0,40),
     provenance:sanitizeProvenance(meta.provenance),
+    // Local-model binding: the SHA-256 prefix this agent registered with, taken from the
+    // stored provenance (sanitizeProvenance drops it, so surface it explicitly here). Used
+    // at launch to refuse a different .gguf for the same address. Empty for cloud agents.
+    model_sha:(typeof meta.provenance?.sha256 === "string" ? meta.provenance.sha256.replace(/[^a-fA-F0-9]/g,"").slice(0,16).toLowerCase() : ""),
     created_at:chainCreatedAt,
     sponsored_registration:fundingFlag === 1
   };
@@ -8692,6 +8702,67 @@ function resolveProvenance(provider, customBaseUrl, customModel) {
   return { provider, model: cloudModelFor(provider, customModel), src: "cloud" };
 }
 
+// The agent identity-box metadata is capped at AGENT_METADATA_MAX (384 bytes). On read,
+// sanitizeProvenance keeps only {src, provider, model}, and the local-model binding reads
+// provenance.sha256 — so verbose provenance fields (verified, note, runtime, model_url, …)
+// are dead weight on chain. Slim the STORED provenance to exactly what is read back,
+// preserving sha256 for the model binding. Live display / post provenance is unaffected.
+function slimProvenanceForStorage(prov) {
+  if (!prov || typeof prov !== "object") return prov;
+  const slim = { provider: prov.provider, model: prov.model, src: prov.src };
+  if (prov.sha256) slim.sha256 = String(prov.sha256).slice(0, 16);
+  return slim;
+}
+
+// Single source of truth for the agent identity-box metadata payload, so the live byte-budget
+// check below and the actual registration measure EXACTLY the same bytes (no drift).
+function makeAgentRegistrationPayload(base_name, personality_id, owner, provider, topic, provenance) {
+  return {
+    base_name, personality_id, owner,
+    created_at: Date.now(),
+    last_seen: Date.now(),
+    provider, post_count: 0, reply_count: 0,
+    topic,
+    provenance,
+    algo_name: null,
+  };
+}
+
+// Live identity-metadata size for the Advanced register form. The owner address is always
+// 58 chars and the timestamps 13 digits, so right-length placeholders make this byte-exact
+// against what registration will commit. When no live provenance exists yet (brain not
+// loaded), assume the largest case (a local custom GGUF carries a 16-hex sha256) so the
+// estimate is conservative and never under-counts.
+function advancedRegisterMetadataBytes() {
+  const provider = document.getElementById("llmProvider")?.value || "wllama";
+  const customBaseUrl = document.getElementById("customBaseUrl")?.value.trim() || "";
+  const customModel = document.getElementById("customModel")?.value.trim() || "";
+  const base = normalizeAgentBaseName(document.getElementById("agentName")?.value || "");
+  const topic = sanitizeTopic(document.getElementById("agentTopic")?.value);
+  const personality_id = String(_chosenPersonality || "storyteller").slice(0, 40);
+  let prov;
+  try { prov = slimProvenanceForStorage(resolveProvenance(provider, customBaseUrl, customModel)); } catch (_) { prov = null; }
+  if (!prov) prov = { provider: "wllama", model: "Custom GGUF", src: "local", sha256: "0000000000000000" };
+  const payload = makeAgentRegistrationPayload(base, personality_id, "A".repeat(58), provider, topic, prov);
+  return strBytes(JSON.stringify(payload)).length;
+}
+
+// Live budget indicator + REGISTER gate for the Advanced form. Only meaningful while
+// registering a NEW agent (logging in reuses chain values and rebuilds no metadata).
+function updateAdvancedRegisterBudget() {
+  const el = document.getElementById("agentMetaBudget");
+  const isReg = (typeof getAgentMode === "function") && getAgentMode() === "register";
+  const used = isReg ? advancedRegisterMetadataBytes() : 0;
+  const over = isReg && used > AGENT_METADATA_MAX;
+  window.__agentMetaOverBudget = over;
+  if (!el) return;
+  if (!isReg) { el.textContent = ""; el.style.color = ""; return; }
+  el.textContent = over
+    ? "\u26a0 on-chain identity is " + (used - AGENT_METADATA_MAX) + " byte(s) over the " + AGENT_METADATA_MAX + " limit \u2014 shorten the name or topic"
+    : "on-chain identity: " + used + " / " + AGENT_METADATA_MAX + " bytes";
+  el.style.color = over ? "#ff6b6b" : "";
+}
+
 // §V: resolve provenance at ACTION time, not launch time. Every local agent shares
 // the one live local engine, so a swap from pinned Qwen to a custom GGUF (or back)
 // must be reflected the moment a post / reply / canvas is serialised — never a
@@ -9259,21 +9330,12 @@ async function _launchAgentImpl(options = {}) {
       if (!customModel)   throw new Error("Custom endpoint: Model name is required (e.g. llama3.2)");
     } else if (provider === "wllama") {
       if (localBrainPending && !options.allowPendingBrain) throw new Error("Local brain not loaded. Pick \u201cLocal brain\u201d and click LOAD LOCAL BRAIN above first.");
-      // §5: a brain loaded in limited Chat mode is real but cannot fit the agent
-      // prompt — block launching a local autonomous agent (Chat stays available).
-      if (!localBrainPending && window.sabhaBrain?.agentCapable?.() === false) {
-        throw new Error("Local brain loaded in limited Chat mode. This device/runtime does not provide enough context for autonomous agent actions — use a cloud provider or a worker-capable browser.");
-      }
-      // §2: a custom (unverified) model may operate an autonomous agent ONLY when its
-      // native chat template was actually rendered, tokenised and probed on this exact
-      // engine (templateVerified). "Unverified" weights are permitted to operate; an
-      // unverifiable template is not. Quick Start stays pinned-Qwen-only separately.
-      {
-        const _m = window.sabhaBrain?.activeModel?.();
-        if (!localBrainPending && _m && _m.verified === false && window.sabhaBrain?.templateVerified?.() !== true) {
-          throw new Error("This custom model is available for local Chat, but its native chat-template compatibility could not be verified for autonomous agents on this runtime.");
-        }
-      }
+      // BYPASS (operator decision): any loaded local brain may register / launch an
+      // autonomous agent, regardless of agent-prompt capability or native chat-template
+      // verification. The agent is BOUND to its exact model instead — register_agent
+      // stores the model SHA-256 (provenance.sha256) and re-launching this address under
+      // a different .gguf is refused below. A model that cannot fit the agent prompt may
+      // simply fail to generate; that tradeoff is accepted by enabling this path.
     } else {
       if (!apiKey) throw new Error("API key required for cloud providers (or switch to Chrome built-in AI, Local WebLLM, wllama, or a Custom endpoint)");
     }
@@ -9308,6 +9370,17 @@ async function _launchAgentImpl(options = {}) {
       throw new Error(isReactivation
         ? `This permanent identity is retired. Switch to "Register a new agent" mode to reactivate ${ident.name} with self-funded identity-box MBR.`
         : `No agent registered at this address. Switch to "Register a new agent" mode to create one with this mnemonic.`);
+    }
+    // Model binding: a registered wllama agent is permanently tied to the SHA-256 of the
+    // .gguf it registered with (stored as provenance.sha256, surfaced as ident.model_sha).
+    // Re-launching the same address under a DIFFERENT local model is refused. Legacy or
+    // cloud agents that carry no stored model hash are unaffected.
+    if (provider === "wllama" && ident.registered && ident.model_sha) {
+      const _am = window.sabhaBrain?.activeModel?.();
+      const loadedSha = String(_am?.sha256 || "").replace(/[^a-fA-F0-9]/g, "").slice(0, 16).toLowerCase();
+      if (loadedSha && loadedSha !== ident.model_sha) {
+        throw new Error("This agent registered with a specific local model (GGUF " + ident.model_sha + "\u2026). The brain currently loaded is a different model (" + loadedSha + "\u2026). Load the original .gguf for this agent, or register a new agent for the new model.");
+      }
     }
     // `account` here is a signing context: { addr, signer, format, ... }.
     // Works uniformly for algo25 (algosdk basic signer) and arc52 (HD signer via xhd-wallet-api).
@@ -9357,17 +9430,13 @@ async function _launchAgentImpl(options = {}) {
       logToUI(isReactivation
         ? `<span class='warn'>  Permanent name and original chain timestamp will be preserved. Address ${escapeHTML(addr.slice(0,12))}…</span>`
         : `<span class='warn'>  ⚠️ Username is PERMANENT — committing to chain now. Address ${escapeHTML(addr.slice(0,12))}…</span>`);
-      const payload = {
-        base_name: normalizeAgentBaseName(name.slice(0,-9)), personality_id, owner: addr,
-        created_at: Date.now(),
-        last_seen: Date.now(),
-        provider, post_count: 0, reply_count: 0,
-        topic,
-        provenance: resolveProvenance(provider, customBaseUrl, customModel),
-        algo_name: null,
-      };
+      const payload = makeAgentRegistrationPayload(
+        normalizeAgentBaseName(name.slice(0,-9)), personality_id, addr, provider, topic,
+        slimProvenanceForStorage(resolveProvenance(provider, customBaseUrl, customModel))
+      );
       const metadataJson = JSON.stringify(payload);
-      if (strBytes(metadataJson).length > AGENT_METADATA_MAX) throw new Error("Agent metadata exceeds the on-chain limit (384 bytes). Reduce custom settings and retry.");
+      const _metaBytes = strBytes(metadataJson).length;
+      if (_metaBytes > AGENT_METADATA_MAX) throw new Error("On-chain identity metadata is " + (_metaBytes - AGENT_METADATA_MAX) + " byte(s) over the " + AGENT_METADATA_MAX + "-byte limit. Shorten the name or topic and retry.");
       const _reg=await registerAgentRouted(account,name,metadataJson);
       registrationNamespace=_reg.ns;
       const txId = _reg.txId;
@@ -11312,6 +11381,17 @@ function onProviderChange() {
                          `If this model name stops working, type the replacement here.`;
     }
   }
+  try { updateAdvancedRegisterBudget(); } catch (_) {}
+}
+
+// Local-brain "Brain source" sub-selector (inside #wllamaRow): the "use a .gguf from this
+// device" button is shown ONLY when the operator chooses to load from the local drive.
+// Purely presentational — it does not change which provider ("wllama") is active.
+function onWllamaBrainSourceChange() {
+  const sel = document.getElementById("wllamaBrainSource");
+  const btn = document.getElementById("btnImportLocalBrain");
+  if (!btn) return;
+  btn.classList.toggle("hidden", !(sel && sel.value === "local"));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -12968,11 +13048,15 @@ function cityLeave() {
     var prov = $("llmProvider") ? $("llmProvider").value : "";
     var launchBtn = $("launchAgentBtn");
     if (launchBtn && !launchBtn.dataset.busy) {
-      // §5: local-brain launch requires a brain that is both ready AND agent-capable
-      // (a limited Chat-mode brain cannot run autonomous actions).
-      launchBtn.disabled = (prov === "wllama")
-        ? !(brain && brain.isReady && brain.isReady() && brain.agentCapable && brain.agentCapable() !== false)
-        : false;
+      // BYPASS (operator decision): a local-brain agent may be registered / launched with
+      // ANY loaded brain. The button only requires the brain to be loaded; capability and
+      // native-template verification are no longer gates (the agent is bound to its model
+      // SHA-256 instead, enforced in _launchAgentImpl). It is additionally disabled while the
+      // typed name + topic would push the on-chain identity metadata past its 384-byte limit.
+      try { updateAdvancedRegisterBudget(); } catch (_) {}
+      launchBtn.disabled = !!window.__agentMetaOverBudget || ((prov === "wllama")
+        ? !(brain && brain.isReady && brain.isReady())
+        : false);
     }
     // Section 4: while one model operation owns the lock, disable the competing
     // model-op buttons so two cannot run at once. Pause stays driven by download
