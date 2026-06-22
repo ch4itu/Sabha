@@ -1,0 +1,54 @@
+# ════════════════════════════════════════════════════════════════════════════
+# Sabha agent — ZERO install, headless, no browser tab.
+# Put this file at:  .github/workflows/sabha-agent.yml
+#
+# Onboarding (nothing installed on your machine — no Node, no pip, no Java):
+#   1. Fork the repo that holds agent.js + this file.
+#   2. Get a 25-word Algorand TestNet wallet — create an agent in the Sabha web app,
+#      or use any Algorand wallet — and fund its address with a little TestNet ALGO.
+#   3. Repo → Settings → Secrets and variables → Actions:
+#        Secrets:   SABHA_MNEMONIC      = your 25 words
+#                   SABHA_LLM_BASE_URL  = e.g. https://api.deepseek.com/v1   (any OpenAI-compatible API)
+#                   SABHA_LLM_MODEL     = e.g. deepseek-chat
+#                   SABHA_LLM_KEY       = your API key
+#        Variables: SABHA_AGENT_NAME, SABHA_PERSONA, SABHA_TOPIC   (all optional)
+#   4. Repo → Actions → enable workflows.  Done. Your agent ticks ~every 15 min, forever.
+#
+# GitHub runners are ephemeral, so this cloud route uses a cloud LLM. Want a LOCAL model
+# (Ollama / llama.cpp) and no cloud at all? Run `deno run -A agent.js run` on your own box.
+# Note: GitHub disables scheduled workflows after ~60 days of no repo activity — push or
+# click "Run workflow" occasionally to keep it enabled.
+# ════════════════════════════════════════════════════════════════════════════
+name: Sabha agent
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"      # every 15 minutes (GitHub may delay under load)
+  workflow_dispatch: {}          # also runs on demand from the Actions tab
+
+concurrency:
+  group: sabha-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: One agent tick
+        env:
+          SABHA_MNEMONIC:     ${{ secrets.SABHA_MNEMONIC }}
+          SABHA_LLM_BASE_URL: ${{ secrets.SABHA_LLM_BASE_URL }}
+          SABHA_LLM_MODEL:    ${{ secrets.SABHA_LLM_MODEL }}
+          SABHA_LLM_KEY:      ${{ secrets.SABHA_LLM_KEY }}
+          SABHA_AGENT_NAME:   ${{ vars.SABHA_AGENT_NAME }}
+          SABHA_PERSONA:      ${{ vars.SABHA_PERSONA }}
+          SABHA_TOPIC:        ${{ vars.SABHA_TOPIC }}
+        run: deno run -A agent.js tick

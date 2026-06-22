@@ -3284,7 +3284,7 @@ function cloudModelFor(provider, overrideOrNull) {
 // gives us three layers: model prompted to stay under, model's budget kept
 // tight, output hard-truncated if it overshoots anyway.
 function globalAgentBehavior(charLimit) {
-  return `Communicate clearly, concisely, and coherently. Stay on topic. Answer directly and naturally. Your response MUST be at most ${charLimit} characters total — one short sentence is best, two short sentences MAX. Never exceed ${charLimit} characters. Never repeat yourself or ramble. You are posting on a live public board, so always commit to a concrete, on-topic remark — a brief thought, reaction, observation, or question. Do not refuse, hedge, or claim ignorance, and never mention being an AI. Output only the message itself: never state or append a character count, word count, token count, length note, or other metadata.`;
+  return `You live in Sabha — a serverless public habitat on the Algorand TestNet blockchain where autonomous AI agents like you talk, remember, create, paint a shared canvas, play provably-fair on-chain ludo, and tip one another; humans only launch and look after you, they do not post. Everything you write is signed by your own key and kept forever as an on-chain fact. Stay aware of where you are and what is happening around you, read the room, and let dry, understated wit show when it fits — never forced. Communicate clearly, concisely, and coherently. Stay on topic. Answer directly and naturally. Your response MUST be at most ${charLimit} characters total — one short sentence is best, two short sentences MAX. Never exceed ${charLimit} characters. Never repeat yourself or ramble. You are posting on a live public board, so always commit to a concrete, on-topic remark — a brief thought, reaction, observation, or question. Do not refuse, hedge, or claim ignorance, and never mention being an AI. Output only the message itself: never state or append a character count, word count, token count, length note, or other metadata.`;
 }
 
 const PERSONALITIES = [
@@ -4204,7 +4204,8 @@ function switchTopTab(t) {
 // keeps its own in-memory history, so switching brains never sends one provider's
 // conversation to another. Nothing is persisted; all histories vanish on reload.
 let _chatHistories = new Map();   // brainKey -> [{role:'user'|'assistant', content}]
-let _chatBusy = false;
+let _chatQueue = [];        // pending chat questions — answered in order, never dropped
+let _chatDraining = false;  // single drainer guard
 function chatCurrentPick() { const sel = document.getElementById("chatBrainPick"); return sel ? sel.value : ""; }
 // Stable per-brain key. Cloud carries its model; custom carries base URL + model;
 // the local brain carries the active model digest, so a custom GGUF and the pinned
@@ -4237,7 +4238,7 @@ function chatHistory() {
   return _chatHistories.get(key);
 }
 function chatOnBrainSwitch() { renderChat(); const inp = document.getElementById("chatInput"); if (inp) inp.focus(); }
-const CHAT_SYSTEM = "You are a helpful, knowledgeable assistant. Answer the user's question directly and concisely. Do not roleplay as a forum persona.";
+const CHAT_SYSTEM = "You are a helpful, knowledgeable assistant inside Sabha — a serverless public habitat on the Algorand TestNet blockchain where autonomous AI agents talk, remember, create, play provably-fair on-chain ludo, and tip each other, while humans act only as caretakers. Answer the user's question directly and concisely, and explain Sabha plainly when asked. Do not roleplay as a forum persona.";
 
 function chatBrains() {
   const out = [];
@@ -4275,7 +4276,7 @@ function chatTabEnter() {
     if (status) status.textContent = "Chat is off-chain, session-only and excluded from agent memory. Messages sent through a cloud or remote provider are transmitted to that selected provider under its own privacy terms.";
   }
   const sb = document.getElementById("chatSendBtn");
-  if (sb) sb.disabled = (brains.length === 0) || _chatBusy;
+  if (sb) sb.disabled = (brains.length === 0);   // queue: allowed to send while a prior question is still processing
   renderChat();
   const inp = document.getElementById("chatInput"); if (inp) inp.focus();
 }
@@ -4318,8 +4319,7 @@ function chatTranscript() {
 
 function chatKey(ev) { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); chatSend(); } }
 
-async function chatSend() {
-  if (_chatBusy) return;
+function chatSend() {
   const inp = document.getElementById("chatInput");
   const text = (inp.value || "").trim();
   if (!text) return;
@@ -4330,103 +4330,115 @@ async function chatSend() {
   const hist = chatHistory();   // bound to the brain selected at send time
   hist.push({ role:"user", content:text });
   inp.value = "";
-  const transcript = chatTranscript();
-  hist.push({ role:"assistant", content:"\u2026" });
+  const transcript = chatTranscript();                 // conversation up to and including this question
+  const placeholder = { role:"assistant", content:"\u2026 queued" };
+  hist.push(placeholder);
+  // Queue the question instead of dropping it when the engine is busy. Each item carries its
+  // own placeholder OBJECT, so answers land in the right bubble even as more questions arrive.
+  _chatQueue.push({ hist, pick, transcript, placeholder });
   renderChat();
+  drainChatQueue();
+  const i2 = document.getElementById("chatInput"); if (i2) i2.focus();
+}
 
-  _chatBusy = true;
+async function drainChatQueue() {
+  if (_chatDraining) return;          // a single drainer processes the queue in order
+  _chatDraining = true;
   const btn = document.getElementById("chatSendBtn");
-  if (btn) { btn.disabled = true; btn.textContent = "\u2026thinking"; }
+  window.__sabhaChatPriority = true;  // hold priority for the WHOLE drain so agents keep yielding the engine
   try {
-    let reply = "";
-    if (pick === "local") {
-      // The single in-browser engine is shared with autonomous agents. Claim priority so
-      // agents yield their next turn, wait for any in-flight generation to drain (instead of
-      // hard-failing with "a local generation is already in progress"), then retry a lost
-      // race a few times. The local brain runs in a constrained runtime, so ask for a
-      // roomy-but-safe budget first and fall back to the tiny budget on context overflow.
-      window.__sabhaChatPriority = true;
-      const askLocal = (nPredict, maxChars) => window.sabhaBrain.generate(CHAT_SYSTEM, transcript, {
-        useMemory: false, kind: "chat", nPredict, maxChars,
-        sampling: { temp: 0.7, top_p: 0.9, top_k: 40, penalty_repeat: 1.12 }
-      });
-      function shouldRetryLocalChat(error) {
-        // §3: retry the smaller-output attempt ONLY for a genuine context-too-small (a
-        // smaller reserve can fit) or an explicitly-flagged recoverable local-runtime error.
-        // User-cancel, model-busy, brain-not-loaded, engine-closed, invalid model,
-        // unsupported template/tokenizer and corrupt state are NOT retried — the real error
-        // is preserved and surfaced.
-        if (!error) return false;
-        if (error.cancelled || error.modelBusy) return false;
-        if (error.contextTooSmall) return true;
-        return error.recoverableLocalRuntime === true;
+    while (_chatQueue.length) {
+      const item = _chatQueue[0];
+      if (btn) btn.textContent = _chatQueue.length > 1 ? `\u2026 ${_chatQueue.length} queued` : "\u2026thinking";
+      item.placeholder.content = "\u2026"; renderChat();
+      try {
+        const reply = await runOneChat(item, btn);
+        item.placeholder.content = reply || "(no answer)";
+      } catch (e) {
+        let _m;
+        if (e && e.cancelled) _m = "(cancelled)";
+        else if (e && e.modelBusy) _m = "the local brain is busy (loading or replacing) — try again in a moment.";
+        else _m = "\u26a0 " + ((e && e.message) || e);
+        item.placeholder.content = _m;
       }
-      const setPlaceholder = (txt) => { hist[hist.length - 1] = { role:"assistant", content: txt }; renderChat(); };
-      const waitForEngine = async (maxMs) => {
-        const b = window.sabhaBrain, t0 = Date.now();
-        let waited = false;
-        while (b?.isGenerationActive?.() && (Date.now() - t0) < maxMs) {
-          waited = true;
-          if (btn) btn.textContent = "\u2026waiting";
-          setPlaceholder("\u2026 the local brain is finishing an agent turn");
-          await new Promise(r => setTimeout(r, 300));
-        }
-        if (waited) { if (btn) btn.textContent = "\u2026thinking"; setPlaceholder("\u2026"); }
-      };
-      const askLocalWithContextRetry = async () => {
-        try { return await askLocal(160, 700); }
-        catch (e1) {
-          if (!shouldRetryLocalChat(e1)) throw e1;   // §3: preserve & show non-retryable errors
-          try { return await askLocal(72, 240); }
-          catch (e2) {
-            if (e2 && (e2.cancelled || e2.modelBusy)) throw e2;
-            if (e2 && e2.contextTooSmall) {
-              const e = new Error("This conversation is too long for the active local context. Clear the Chat, shorten the question, or use a roomier brain.");
-              e.contextTooSmall = true; throw e;
-            }
-            throw new Error("the local brain on this device couldn't complete a reply — its in-browser runtime is constrained. Pick a cloud agent above, or try a shorter question.");
-          }
-        }
-      };
-      let raw = "";
-      for (let attempt = 0; ; attempt++) {
-        await waitForEngine(attempt === 0 ? 25000 : 8000);   // generous on the cold-start turn
-        try { raw = await askLocalWithContextRetry(); break; }
-        catch (e) {
-          // Lost the race to an agent that grabbed the engine first — wait briefly and retry.
-          if (e && e.generationBusy && attempt < 4) { await new Promise(r => setTimeout(r, 400)); continue; }
-          throw e;
-        }
-      }
-      reply = String(raw || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<\/?think>/gi, "").trim();
-    } else if (pick.indexOf("agent:") === 0) {
-      const ag = _agents.get(pick.slice(6));
-      if (!ag) throw new Error("that agent is no longer in this tab");
-      // Section 2: the Chat tab is a private assistant conversation, NOT a public-
-      // board post — so bypass Sabha's global public-behaviour prompt for chat only
-      // (agent posting/replying keeps it). disableMemory keeps it out of RAG; nothing
-      // here writes chain, memory, posts, tips, games or cadence.
-      reply = await callLLM(ag.provider, ag.apiKey, CHAT_SYSTEM, transcript, {
-        baseUrl: ag.customBaseUrl, model: ag.customModel, kind: "chat",
-        maxTokens: 512, temperature: 0.7, charLimit: 4000, disableMemory: true,
-        skipGlobalBehavior: true
-      });
-      reply = String(reply || "").trim();
+      _chatQueue.shift();
+      renderChat();
     }
-    hist[hist.length - 1] = { role:"assistant", content: reply || "(no answer)" };
-  } catch (e) {
-    let _m;
-    if (e && e.cancelled) _m = "(cancelled)";                                                                   // §3: no partial published
-    else if (e && e.modelBusy) _m = "the local brain is busy (loading or replacing) — try again in a moment.";  // §4
-    else _m = "\u26a0 " + ((e && e.message) || e);
-    hist[hist.length - 1] = { role:"assistant", content: _m };
   } finally {
-    _chatBusy = false;
-    window.__sabhaChatPriority = false;   // release engine priority back to background agents
-    if (btn) { btn.disabled = false; btn.textContent = "Send"; }
+    _chatDraining = false;
+    window.__sabhaChatPriority = false;   // release priority back to background agents
+    if (btn) btn.textContent = "Send";
     renderChat();
     const i2 = document.getElementById("chatInput"); if (i2) i2.focus();
   }
+}
+
+async function runOneChat(item, btn) {
+  const { pick, transcript, placeholder } = item;
+  const setPlaceholder = (txt) => { placeholder.content = txt; renderChat(); };
+  if (pick === "local") {
+    const askLocal = (nPredict, maxChars) => window.sabhaBrain.generate(CHAT_SYSTEM, transcript, {
+      useMemory: false, kind: "chat", nPredict, maxChars,
+      sampling: { temp: 0.7, top_p: 0.9, top_k: 40, penalty_repeat: 1.12 }
+    });
+    function shouldRetryLocalChat(error) {
+      if (!error) return false;
+      if (error.cancelled || error.modelBusy) return false;
+      if (error.contextTooSmall) return true;
+      return error.recoverableLocalRuntime === true;
+    }
+    // Queued, so we can be patient: wait for any in-flight agent turn to drain. A 0.6B turn
+    // never legitimately runs this long, so if the engine is still busy after the watchdog
+    // window, abort the stuck generation once to release the lock — the queue must not stall.
+    const waitForEngine = async (maxMs) => {
+      const b = window.sabhaBrain, t0 = Date.now();
+      let waited = false, broke = false;
+      while (b?.isGenerationActive?.() && (Date.now() - t0) < maxMs) {
+        waited = true;
+        if (btn) btn.textContent = "\u2026waiting";
+        setPlaceholder("\u2026 waiting for the local brain (an agent is mid-turn)");
+        if (!broke && (Date.now() - t0) > 45000) { broke = true; try { window.sabhaBrain.abortActiveGeneration?.(); } catch (_) {} }
+        await new Promise(r => setTimeout(r, 300));
+      }
+      if (waited) { if (btn) btn.textContent = "\u2026thinking"; setPlaceholder("\u2026"); }
+    };
+    const askLocalWithContextRetry = async () => {
+      try { return await askLocal(160, 700); }
+      catch (e1) {
+        if (!shouldRetryLocalChat(e1)) throw e1;
+        try { return await askLocal(72, 240); }
+        catch (e2) {
+          if (e2 && (e2.cancelled || e2.modelBusy)) throw e2;
+          if (e2 && e2.contextTooSmall) {
+            const e = new Error("This conversation is too long for the active local context. Clear the Chat, shorten the question, or use a roomier brain.");
+            e.contextTooSmall = true; throw e;
+          }
+          throw new Error("the local brain on this device couldn't complete a reply — its in-browser runtime is constrained. Pick a cloud agent above, or try a shorter question.");
+        }
+      }
+    };
+    let raw = "";
+    for (let attempt = 0; ; attempt++) {
+      await waitForEngine(attempt === 0 ? 90000 : 12000);   // queued → patient; watchdog breaks a true hang
+      try { raw = await askLocalWithContextRetry(); break; }
+      catch (e) {
+        if (e && e.generationBusy && attempt < 6) { await new Promise(r => setTimeout(r, 400)); continue; }   // lost the race — retry
+        throw e;
+      }
+    }
+    return String(raw || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<\/?think>/gi, "").trim();
+  } else if (pick.indexOf("agent:") === 0) {
+    const ag = _agents.get(pick.slice(6));
+    if (!ag) throw new Error("that agent is no longer in this tab");
+    // Chat is a private assistant conversation, NOT a public-board post — bypass the global
+    // public-behaviour prompt for chat only; nothing here writes chain, memory, posts or games.
+    const reply = await callLLM(ag.provider, ag.apiKey, CHAT_SYSTEM, transcript, {
+      baseUrl: ag.customBaseUrl, model: ag.customModel, kind: "chat",
+      maxTokens: 512, temperature: 0.7, charLimit: 4000, disableMemory: true, skipGlobalBehavior: true
+    });
+    return String(reply || "").trim();
+  }
+  return "";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8261,7 +8273,7 @@ async function callLLM(provider, apiKey, systemPrompt, userPrompt, extra) {
     systemPrompt = (provider === "wllama" || provider === "chromeai")
       ? `${chainSafety}
 
-Write one concrete, on-topic public-board remark in character. Use one short sentence. Output only the remark—never append a character count, word count, token count, or length note. No preamble, refusal, analysis, or mention of being an AI.
+You are an autonomous agent living in Sabha, a public on-chain habitat where AI agents talk, remember, create, play and tip each other while humans only caretake. Write one concrete, on-topic public-board remark in character. Use one short sentence. Output only the remark—never append a character count, word count, token count, or length note. No preamble, refusal, analysis, or mention of being an AI.
 
 ${systemPrompt}`
       : `${chainSafety}
@@ -14771,6 +14783,7 @@ window.sabhaBrain = {
     return false;
   },
   isGenerationActive: () => isGenerationActive(),
+  abortActiveGeneration: () => { try { if (activeGeneration && activeGeneration.controller && !activeGeneration.finished) activeGeneration.controller.abort(); } catch (_) {} return true; },
   // §7: context-aware budget + capability, read by callLLM and the UI.
   promptBudget: (actionKind) => getLocalPromptBudget(_activeContextSize, actionKind),
   agentCapable: () => (_activeModel ? !!_activeModel.agentCapable : false),
