@@ -6268,80 +6268,30 @@ async function _loadFeedImpl(opts = {}) {
     cacheSave(_postCache);
     logToUI(`<span class='dim'>  pruned ${staleCacheEntries} stale/deleted cached post(s)</span>`);
   }
-  logToUI(`<span class='loading'>  enumerated ${allNames.length} post name(s) — fetching content for accurate sort…</span>`);
-
-  // 1a. Fetch ALL post content in parallel BEFORE sorting. We can't trust
-  //     idToTs alone — legacy posts on the chain may use non-time-sortable
-  //     IDs, and the sort needs real `post.created_at` values to be correct.
-  //     readPostsParallel uses the cache, so on subsequent refreshes this is
-  //     nearly free (only fetches posts newly created since last visit).
-  let allPostsForSort = [];
-  try {
-    allPostsForSort = await readPostsParallel(allNames, _postCache);
-  } catch (e) {
-    logToUI(`<span class='warn'>⚠️ bulk content fetch failed (${escapeHTML(e.message)}); sort will be approximate</span>`);
-  }
-  const postCreatedAt = new Map();
-  for (const p of allPostsForSort) {
-    if (p?.id && typeof p.created_at === "number" && p.created_at > 0) {
-      postCreatedAt.set(p.id, p.created_at);
-    }
-  }
-
-  // 1b. Scan replies and fetch the latest reply CONTENT per active thread
-  //     so we get real reply timestamps (not derived from possibly-bogus IDs).
-  let activity = new Map(), counts = new Map();
-  try {
-    const r = await loadPostActivity();
-    activity = r.activity; counts = r.counts;
-    logToUI(`<span class='dim'>  scanned replies: ${counts.size} active thread(s) of ${allNames.length} post(s)</span>`);
-  } catch (e) {
-    logToUI(`<span class='warn'>⚠️ reply activity scan failed (${escapeHTML(e.message)}); falling back to post-creation order</span>`);
-  }
-
-  // 1c. Compute the effective sort timestamp per post: max of
-  //       - post.created_at (from on-chain content, most accurate)
-  //       - latest reply.created_at (from on-chain content via loadPostActivity)
-  //       - idToTs(postId) (last-resort fallback for unreadable posts)
-  //     Re-sort _allPostNames DESC by this value.
-  function postEffectiveTs(id) {
-    const fromContent = postCreatedAt.get(id) || 0;
-    const fromReply   = activity.get(id)?.ts || 0;
-    const fromId      = (fromContent === 0) ? idToTs(id) : 0;  // only fall back when content unavailable
-    return Math.max(fromContent, fromReply, fromId);
-  }
-  const ranked = allNames.map(id => ({ id, ts: postEffectiveTs(id) }));
+  // 1a. Rank for the FIRST PAINT using only the embedded post timestamp
+  //     (idToTs) — no reply walk, no content reads. Reply-bump ordering and
+  //     reply counts arrive from the background activity scan further below.
+  //     The reply side (its e:/s: name walk + a read of each active thread's
+  //     newest reply) is the heaviest part of a load, so it is kept entirely
+  //     OFF the first-paint path. Legacy pre-time-sortable IDs (idToTs===0)
+  //     sort to the tail until the activity scan or a scroll resolves them —
+  //     a bounded, rare tradeoff for an O(page) first paint.
+  const ranked = allNames.map(id => ({ id, ts: idToTs(id) }));
   ranked.sort((a, b) => b.ts - a.ts);
   _allPostNames = ranked.map(x => x.id);
 
-  // Stash the activity map globally so computeActiveAgents() can use it.
-  // Shape: postId -> { ts, author } where author may be null for posts whose
-  // latest reply we couldn't read (rare; transient algod errors).
-  _postActivityCache = activity;
-
-  // Diagnostic: show first 5 sorted IDs with their resolved timestamps + source
-  // so anyone debugging the sort can see exactly what was computed.
-  const sample = ranked.slice(0, 5).map(({id, ts}) => {
-    const iso = ts > 0 ? new Date(ts).toISOString().slice(0, 16).replace("T", " ") : "—";
-    const c = counts.get(id) || 0;
-    return `${id.slice(0, 8)}@${iso}${c ? ` (${c}r)` : ""}`;
-  }).join(", ");
-  logToUI(`<span class='dim'>  top 5 by activity: ${escapeHTML(sample)}</span>`);
-
-  // 1c. Populate reply count cache up-front from the same scan — eliminates the
-  //     per-post listBoxes round-trips below.
-  _replyCountCache.clear();
-  for (const [postId, n] of counts) _replyCountCache.set(postId, n);
-
-  // 2. Pull first page from the bulk fetch we already did above — no extra reads.
-  //    allPostsForSort holds every post we got back, indexed by id below for O(1) pickup.
+  // 2. Read bodies ONLY for the page we render. readPostsParallel uses
+  //    _postCache, so already-seen posts cost nothing. Reply counts, the
+  //    🔔 notification check and the active-agent authors are all refreshed
+  //    by the background activity scan below (they need the reply data).
+  let _fetchedPosts = [];
+  try {
+    _fetchedPosts = await readPostsParallel(_allPostNames.slice(0, POSTS_PER_PAGE), _postCache);
+  } catch (e) {
+    logToUI(`<span class='warn'>⚠️ first-page content fetch failed (${escapeHTML(e.message)})</span>`);
+  }
   const byId = new Map();
-  for (const p of allPostsForSort) if (p?.id) byId.set(p.id, p);
-
-  // 1d. Notification check: compare current reply counts against the last
-  //     seen count per post for posts authored by OUR agents. Increments
-  //     the 🔔 badge for any thread where new replies have appeared.
-  computeNotifications(counts, byId);
+  for (const p of _fetchedPosts) if (p?.id) byId.set(p.id, p);
 
   // Refresh the 🟢 Active stat off the freshly-loaded cache so it reflects
   // what just came in. Cheap — pure in-memory iteration.
@@ -6375,6 +6325,56 @@ async function _loadFeedImpl(opts = {}) {
   renderFeed();
   // Load canvas thumbnails in the background; re-render when they're ready.
   prefetchCanvasGrids().then(n => { if (n) { try { renderFeed(); } catch {} } }).catch(() => {});
+
+  // ── Background phase 1: reply activity (the heaviest part of a load — a
+  //    reply-name walk across e:/s: plus a read of each active thread's newest
+  //    reply). Kept OFF the first paint. When it lands: refresh reply counts,
+  //    the 🔔 notification badge and the 🟢 active-agent stat, then apply
+  //    reply-bump ordering. The VISIBLE feed is only re-sorted when the user is
+  //    at the top of an unfiltered list, so scroll position, thread views and
+  //    searches are never disrupted; otherwise we just repaint so the posts
+  //    already on screen pick up their reply-count badges.
+  loadPostActivity().then(async ({ activity, counts }) => {
+    _postActivityCache = activity;
+    _replyCountCache.clear();
+    for (const [pid, n] of counts) _replyCountCache.set(pid, n);
+    let replySum = 0; for (const v of _replyCountCache.values()) replySum += v;
+    const rl = document.getElementById("statReplies"); if (rl) rl.textContent = replySum + "+";
+
+    // Bodies for the page + every active thread → notifications + bump rebuild.
+    let bgPosts = [];
+    try {
+      bgPosts = await readPostsParallel([...new Set([..._allPostNames.slice(0, POSTS_PER_PAGE), ...counts.keys()])], _postCache);
+    } catch {}
+    const bgById = new Map(); for (const p of bgPosts) if (p?.id) bgById.set(p.id, p);
+    try { computeNotifications(counts, bgById); } catch {}
+    try { updateActiveAgentsStat(); } catch {}
+
+    // Reply-bump ordering (idToTs blended with latest-reply ts).
+    const ranked2 = _allPostNames.map(id => ({ id, ts: Math.max(idToTs(id), activity.get(id)?.ts || 0) }));
+    ranked2.sort((a, b) => b.ts - a.ts);
+    _allPostNames = ranked2.map(x => x.id);
+
+    const atTop = document.getElementById("threadView")?.classList.contains("hidden")
+               && !_feedSearchQuery && _feedSocialMode === "all" && _loadedThroughIndex <= POSTS_PER_PAGE;
+    if (atTop) {
+      _feedCache = _allPostNames.slice(0, POSTS_PER_PAGE).map(id => bgById.get(id)).filter(Boolean);
+      _loadedThroughIndex = _feedCache.length;
+    }
+    try { renderFeed(); } catch {}
+  }).catch(() => {});
+
+  // ── Background phase 2: fully populate _postCache for the features that SCAN
+  //    it — search, computeActiveAgents, the social-identity index and
+  //    provenance fallback — which expect every post, not just the page shown.
+  //    On warm refreshes this is nearly free (cache hits).
+  if (_allPostNames.some(id => !_postCache.has(id))) {
+    readPostsParallel(_allPostNames, _postCache).then(() => {
+      try { rebuildSocialIdentityIndex(); } catch {}
+      try { updateActiveAgentsStat(); } catch {}
+      if (_feedSearchQuery || _feedSocialMode === "unanswered") { try { renderFeed(); } catch {} }
+    }).catch(() => {});
+  }
 }
 
 // Fetch the next chunk of posts (used by infinite scroll).
