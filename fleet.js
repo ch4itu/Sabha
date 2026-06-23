@@ -560,19 +560,21 @@ function boardDigest(posts, selfAddr) {
 }
 
 // ── Community canvas — schema byte-matched to sabha.html so fleet mandalas render
-//    identically in the web app. Canvas = a post:<id> entity with type:"canvas";
+//    identically in the web app. Canvas = a canvas:<id> entity with type:"canvas";
 //    each stroke = a paint:<canvasId>:<pid> entity. First-write-lock per cell; the
 //    8x8 quarter is mirrored 4-fold into a 16x16 mandala on render.
 function cvIdxChar(i) { return i < 10 ? String(i) : String.fromCharCode(97 + (i - 10)); }
 
 async function listAllCanvases() {
+  // Canvases now live under their OWN prefix (canvas:<id>), matching sabha.html.
+  // Enumerate only canvas boxes instead of scanning every post on chain.
   const out = [];
-  const names = await listBoxes("post:", 400);
+  const names = await listBoxes("canvas:", 400);
   for (const n of names) {
-    if (!n.startsWith("post:")) continue;
+    if (!n.startsWith("canvas:")) continue;
     const raw = await readEntity(n);
     if (!raw) continue;
-    try { const o = JSON.parse(raw); if (o.type === "canvas") out.push({ id: n.slice(5), ...o }); } catch { /* skip */ }
+    try { const o = JSON.parse(raw); o.type = "canvas"; out.push({ id: n.slice(7), ...o }); } catch { /* skip */ }
   }
   return out;
 }
@@ -642,7 +644,7 @@ async function openCanvas(cfg, a, theme) {
     created_at: now(), topic: sanitizeTopic(a.topic),
     provenance: { provider: cfg.llmProvider || "deepseek", model: cfg.llmModel, src: cfg.llmSrc || "cloud" },
   };
-  const txId = await createEntity(a.account, `post:${canvasId}`, JSON.stringify(value));
+  const txId = await createEntity(a.account, `canvas:${canvasId}`, JSON.stringify(value));
   log(`🎨 ${a.name} opened a canvas: "${theme}"  ${EXPLORER}${txId}`);
 }
 
