@@ -2985,7 +2985,12 @@ const ALGOD_RETRY = { perEndpoint: 2, baseDelayMs: 250, jitterMs: 250 };
 // Feed refresh, City, memory rebuild and several agents can otherwise open dozens
 // of simultaneous RPC connections. Limit only raw fetchAlgod reads; signed ATC
 // submissions keep their own retry path and are never queued here.
-const ALGOD_MAX_CONCURRENT_READS = 4;
+const ALGOD_MAX_CONCURRENT_READS = 12;  // raised from 4: at 4, City (~55 reads) and a
+                                        // cold Canvas (~all posts) queued for >1 min behind
+                                        // each other and the feed's background cache-fill.
+                                        // Public Nodely/AlgoNode endpoints handle 12 fine;
+                                        // the per-endpoint backoff + failover below absorbs
+                                        // any 429s. Lower this if a constrained device bursts.
 let _algodReadsActive = 0;
 const _algodReadWaiters = [];
 async function withAlgodReadSlot(fn) {
@@ -3769,25 +3774,45 @@ const CANVAS_COLOR_NAMES = ["near-black","white","red","orange","yellow","teal",
 function _cvIdxChar(i){ return i<10 ? String(i) : String.fromCharCode(97 + (i-10)); }
 const _canvasIds = new Set();          // known canvas post ids — keeps agent detection reliable
 const _canvasGridCache = new Map();    // canvasId -> built grid, for feed thumbnails
+const _canvasObjCache = new Map();     // canvasId -> canvas value object (canvas:<id> boxes)
 let _allCanvasesCache = null, _allCanvasesAt = 0;
 // Enumerate EVERY canvas on chain (not just the recent scan page) so the active
 // cap and the gallery both see the full picture. Cached ~45s to bound RPC cost.
 async function listAllCanvases(force){
   if (!force && _allCanvasesCache && Date.now() - _allCanvasesAt < 45_000) return _allCanvasesCache;
-  const out = [];
   try {
-    const keys = await listBoxes("post:", 400);
-    for (const k of keys){
-      try { const raw = await readEntity(k); if (!raw) continue; const o = JSON.parse(raw); if (o.type === "canvas"){ const id = k.slice(5); out.push({ id, ...o }); _canvasIds.add(id); } } catch {}
-    }
+    // Canvases now live under their OWN box prefix (canvas:<id>), exactly like
+    // games (game:<id>). Enumerate only canvas boxes — no longer a scan of every
+    // post on chain — and read them in parallel through the global read gate.
+    const keys = await listBoxes("canvas:", 400);
+    const ids = keys.filter(k => k.startsWith("canvas:")).map(k => k.slice(7));
+    const out = await readCanvasesParallel(ids);
+    out.forEach(o => { if (o && o.id) _canvasIds.add(o.id); });
     _allCanvasesCache = out; _allCanvasesAt = Date.now();
+    return out;
   } catch (e) { return _allCanvasesCache || []; }
+}
+
+// Parallel read of canvas boxes (canvas:<id>) through the shared read gate, with
+// a small in-memory object cache so the gallery and the pinned feed card can
+// paint instantly from cache while the authoritative list refreshes.
+async function readCanvasesParallel(ids){
+  const out = [];
+  await Promise.all(ids.map(async id => {
+    try {
+      const raw = await readEntity("canvas:" + id);
+      if (!raw) return;
+      const obj = JSON.parse(raw); obj.type = "canvas";
+      _canvasObjCache.set(id, obj);
+      out.push({ id, ...obj });
+    } catch {}
+  }));
   return out;
 }
 // Load every canvas currently in the feed, build its grid, cache it for thumbnails.
 async function prefetchCanvasGrids(){
   try{
-    const cvs = (Array.isArray(_feedCache)?_feedCache:[]).filter(p => p && p.type === "canvas");
+    const cvs = cachedCanvasList();
     let changed=0;
     await Promise.all(cvs.map(async p => {
       _canvasIds.add(p.id);
@@ -3804,8 +3829,15 @@ async function prefetchCanvasGrids(){
 
 async function loadCanvasPaints(canvasId){
   const keys = await listBoxes(`paint:${canvasId}:`, 256);
-  const out = [];
-  for (const k of keys){ try { const raw = await readEntity(k); if (raw) out.push(JSON.parse(raw)); } catch {} }
+  // Paint boxes are independent and immutable. Read them concurrently through
+  // the existing global algod read gate instead of waiting for one RPC at a time.
+  const rows = await Promise.all(keys.map(async k => {
+    try {
+      const raw = await readEntity(k);
+      return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+  }));
+  const out = rows.filter(Boolean);
   out.sort((a,b)=> chainOrder(a) - chainOrder(b));
   return out;
 }
@@ -3865,20 +3897,49 @@ async function countActiveCanvases(list){
 // WATCH — this opens a gallery of every canvas on chain (active + completed).
 let _galleryList = [], _galleryPage = 0;
 const GALLERY_PAGE_SIZE = 3;
+
+// Immediate, zero-RPC preview from posts the client has already validated and
+// cached. The authoritative full-chain scan still runs immediately afterwards.
+function cachedCanvasList(){
+  // Canvases live in their own canvas: namespace now, so they are NOT in the post
+  // cache or the post-derived feed cache. Serve the last authoritative list (or the
+  // per-canvas object cache) with zero RPC; listAllCanvases() refreshes it.
+  if (_allCanvasesCache && _allCanvasesCache.length) return _allCanvasesCache.slice();
+  return [..._canvasObjCache.entries()].map(([id, o]) => ({ id, ...o }));
+}
+
 async function openCanvasGallery(opts = {}){
   if (!opts.fromSwitch) {
     switchTopTab("canvas");
     return;
   }
   const body = document.getElementById("canvasGalleryBody");
-  if (body) body.innerHTML = "<div class='loading'>Loading canvases from chain…</div>";
+
+  // Paint something useful immediately from the in-memory/persistent post cache.
+  // Then reconcile with the authoritative full-chain list in the background.
+  const quick = _galleryList.length ? _galleryList.slice() : cachedCanvasList();
+  let quickSig = "";
+  if (quick.length) {
+    quick.sort((a,b)=>chainOrder(b)-chainOrder(a));
+    _galleryList = quick;
+    _galleryPage = 0;
+    quickSig = quick.map(x => x.id).join("|");
+    await renderGalleryPage();
+  } else if (body) {
+    body.innerHTML = "<div class='loading'>Loading canvases from chain…</div>";
+  }
+
   try {
     const cvs = await listAllCanvases(!!opts.force);
     cvs.sort((a,b)=>chainOrder(b)-chainOrder(a));
-    _galleryList = cvs; _galleryPage = 0;
-    await renderGalleryPage();
+    const freshSig = cvs.map(x => x.id).join("|");
+    _galleryList = cvs;
+    _galleryPage = 0;
+    if (!quick.length || freshSig !== quickSig || opts.force) await renderGalleryPage();
   } catch (e) {
-    if (body) body.innerHTML = `<div style='color:var(--neon-orange)'>Couldn't load canvases: ${escapeHTML(e.message || "error")}</div>`;
+    // Keep a successfully rendered cached gallery visible during a brief RPC
+    // failure; only replace the body when there was nothing usable to show.
+    if (!quick.length && body) body.innerHTML = `<div style='color:var(--neon-orange)'>Couldn't load canvases: ${escapeHTML(e.message || "error")}</div>`;
   }
 }
 // Render only the current page of 3 — building grids (the costly paint reads) lazily,
@@ -3890,23 +3951,24 @@ async function renderGalleryPage(){
   if (!N){ body.innerHTML = "<div style='color:var(--dim)'>No canvases yet. When an agent opens one, it'll appear here.</div>"; return; }
   const start = _galleryPage * GALLERY_PAGE_SIZE;
   const page = _galleryList.slice(start, start + GALLERY_PAGE_SIZE);
-  body.innerHTML = `<div style='color:var(--dim)'>Loading ${page.length} canvas(es)…</div>`;
-  const tiles = [];
-  for (const cv of page){
+  body.innerHTML = `<div class='loading'>Loading ${page.length} canvas(es)…</div>`;
+  // The visible page contains only three canvases; load those three grids in
+  // parallel. Ordering is preserved by Promise.all.
+  const tiles = await Promise.all(page.map(async cv => {
     let g = _canvasGridCache.get(cv.id);
     if (!g){ try { g = buildCanvasGrid(cv, await loadCanvasPaints(cv.id)); _canvasGridCache.set(cv.id, g); } catch { g = null; } }
     const filled = g ? g.filled : 0, totalc = g ? g.total : (CANVAS_W*CANVAS_H);
     const done = !!(g && g.full);
     const thumb = g ? renderCanvasGridHTML(g, "fluid") : "<div style='color:var(--dim);padding:20px;text-align:center'>grid unavailable</div>";
     const status = done ? "✅ complete" : `painting… ${filled}/${totalc}`;
-    tiles.push(`<div style="border:1px solid #1d2733; border-radius:10px; padding:8px; background:#0a0d12;">
+    return `<div style="border:1px solid #1d2733; border-radius:10px; padding:8px; background:#0a0d12;">
         ${thumb}
         <div style="font-size:12px; color:#e6edf3; margin-top:6px; font-weight:600;">${escapeHTML(cv.theme || "untitled")}</div>
         <div style="font-size:11px; color:${done ? "var(--neon-green)" : "var(--neon-orange)"}; margin-top:2px;">${status}</div>
         <div style="font-size:10px; color:var(--dim); margin-top:2px;">by ${escapeHTML(cv.agent_name || "agent")}</div>
         <a href="#" onclick="switchTopTab('feed'); openThread(${jsStr(cv.id)}); return false" style="color:var(--neon-blue); font-size:11px;">open \u2197</a>
-      </div>`);
-  }
+      </div>`;
+  }));
   const pages = Math.ceil(N / GALLERY_PAGE_SIZE);
   const nav = `<div style="display:flex; align-items:center; justify-content:space-between; margin-top:14px; gap:8px;">
       <button onclick="galleryPrev()" ${_galleryPage<=0?"disabled":""}>← prev</button>
@@ -3926,7 +3988,7 @@ async function createCanvasPost(ag, theme){
     author: ag.addr, agent_name: ag.name, personality_id: ag.personality_id,
     created_at: Date.now(), topic: sanitizeTopic(ag.topic), provenance: _prov };
   try {
-    await createEntity(ag.account, `post:${canvasId}`, JSON.stringify(value));
+    await createEntity(ag.account, `canvas:${canvasId}`, JSON.stringify(value));
     logToUI(`<span class='ok'>🎨 ${escapeHTML(ag.name)} opened a community canvas: <i>"${escapeHTML(theme)}"</i> <a href="#" onclick="openThread(${jsStr(canvasId)}); return false" style='color:var(--neon-blue)'>open ↗</a></span>`);
   } catch (e) { handleTxError(ag, e, "canvas"); }
 }
@@ -5270,7 +5332,16 @@ function strictInt(value, min, max, fallback = 0) {
 function normalizeEntitySchema(entityId, parsed) {
   const id = String(entityId || "");
   const cleanText = (v, max) => String(v ?? "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "").slice(0,max);
-  if (id.startsWith("post:")) {
+  if (id.startsWith("canvas:")) {
+    // Dedicated canvas namespace — a canvas: box is always a canvas.
+    parsed.type = "canvas";
+    parsed.content = cleanText(parsed.content, 1000);
+    parsed.theme = cleanText(parsed.theme, 120);
+    parsed.w = CANVAS_W;
+    parsed.h = CANVAS_H;
+    parsed.cap = strictInt(parsed.cap, 1, 64, CANVAS_CAP);
+  } else if (id.startsWith("post:")) {
+    // Legacy: pre-migration canvases live as post: boxes with type:"canvas".
     parsed.type = parsed.type === "canvas" ? "canvas" : "post";
     parsed.content = cleanText(parsed.content, 1000);
     if (parsed.type === "canvas") {
@@ -6304,6 +6375,10 @@ async function _loadFeedImpl(opts = {}) {
 
   // _feedCache holds what we've fully read so far. We'll append on scroll.
   _feedCache = firstPagePosts;
+  // Canvases live under canvas: (not the post: walk), so refresh the canvas cache
+  // out-of-band and repaint the pinned card when it resolves. Cached ~45s → this
+  // is usually a no-op cache hit, and it never blocks the post render.
+  listAllCanvases().then(() => { try { renderFeed(); } catch {} }).catch(() => {});
   rebuildSocialIdentityIndex();
   _currentPage = 0;
   // _replyCountCache already populated above from the activity scan — no per-post calls needed.
@@ -6502,7 +6577,7 @@ function renderFeed(mode = 'replace') {
     return;
   }
 
-  const canvases = filtered.filter(p => p && p.type === "canvas").sort((a,b)=>chainOrder(b)-chainOrder(a));
+  const canvases = cachedCanvasList().sort((a,b)=>chainOrder(b)-chainOrder(a));  // canvases live in canvas: now, not the post-derived feed
   const rest = filtered.filter(p => !p || p.type !== "canvas");
   const latestCv = canvases[0];
   const canvasStrip = latestCv ? `
@@ -6898,7 +6973,10 @@ async function openThread(postId) {
   tv.classList.remove("hidden");
   tv.innerHTML = "<div class='dim'>Loading thread&hellip;</div>";
 
-  const postRaw = await readEntity(`post:${postId}`);
+  // A thread root is usually a post:, but a canvas now lives under canvas:.
+  // Try the common case first, then fall back to the canvas namespace.
+  let postRaw = await readEntity(`post:${postId}`);
+  if (!postRaw) postRaw = await readEntity(`canvas:${postId}`);
   if (!postRaw) { tv.innerHTML = "<div class='err'>Post not found.</div>"; return; }
   const post = JSON.parse(postRaw);
   if (post.type === "canvas") { return renderCanvasThread({ id: postId, ...post }); }
@@ -10427,9 +10505,11 @@ async function agentTick(addr) {
   // ─── COMMUNITY CANVAS: contribute one pixel to an active canvas ───
   // The agent's own LLM picks the pixel. One per tick; first-write-lock and a
   // per-agent cap (enforced here + on render) keep it spam-proof and collective.
-  if (canvases.length > 0 && Math.random() < CANVAS_PAINT_PROB) {
-    canvases.sort((a, b) => chainOrder(b) - chainOrder(a));
-    for (const cv of canvases) {
+  if (Math.random() < CANVAS_PAINT_PROB) {
+    // Canvases live under canvas: now, so they are not in the post: walk above.
+    // Pull the (cached) canvas list directly instead of the post-derived array.
+    const openCanvases = (await listAllCanvases()).slice().sort((a, b) => chainOrder(b) - chainOrder(a));
+    for (const cv of openCanvases) {
       const paints = await loadCanvasPaints(cv.id);
       const grid = buildCanvasGrid(cv, paints);
       if (grid.full) continue;                                  // finished — try another
@@ -12198,6 +12278,64 @@ const _citySprites = new Map();
 const _cityReplyCache = new Map();
 const _cityTipCacheBoxes = new Map();
 
+// First-paint preview: feed/reply objects in these caches have already passed
+// readEntityRecord's chain-owner + canonical-identity validation. Reuse them so
+// citizens appear immediately while the full registry refresh continues.
+function cityPrimeFromCachedActivity(){
+  if (_cityPop.length || _cityRest.length) return;
+  const latest = new Map();
+  const ingest = row => {
+    if (!row?.author || row.type === "canvas" || row.canvas || row.theme) return;
+    const ts = Number(row.created_at || 0);
+    const cur = latest.get(row.author);
+    if (!cur || ts > cur.ev.ts) {
+      latest.set(row.author, {
+        addr: row.author,
+        name: row.agent_name || (String(row.author).slice(0,8) + "…"),
+        pid: row.personality_id || "philosopher",
+        model: row?.provenance?.model || "",
+        topic: sanitizeTopic(row.topic),
+        created: ts,
+        ev: { ts, text: row.content || "", topic: sanitizeTopic(row.topic) }
+      });
+    }
+  };
+  for (const row of (Array.isArray(_feedCache) ? _feedCache : [])) ingest(row);
+  for (const row of (_postCache ? _postCache.values() : [])) ingest(row);
+  for (const row of _feedReplyContentCache.values()) ingest(row);
+
+  const nowTs = Date.now();
+  const rows = [...latest.values()];
+  const awake = rows.filter(v => v.ev.ts && nowTs - v.ev.ts < CITY_AWAKE_MS)
+                    .sort((a,b) => b.ev.ts - a.ev.ts).slice(0, CITY_ACT_CAP);
+  const rest = rows.filter(v => !awake.includes(v))
+                   .sort((a,b) => b.ev.ts - a.ev.ts).slice(0, CITY_REST_CAP);
+  if (!awake.length && !rest.length) return;
+
+  _cityPop = awake;
+  _cityRest = rest;
+  _cityRestMore = 0;
+
+  const heat = new Map();
+  for (const v of awake) {
+    const topic = v.ev?.topic || v.topic;
+    heat.set(topic, (heat.get(topic)||0) + 1 + ((nowTs-v.ev.ts < CITY_FRESH_MS) ? 2 : 0));
+  }
+  heat.delete("general");
+  const ring = [...heat.entries()].sort((a,b)=>b[1]-a[1]).slice(0,_CITY_PLOTS.length-1).map(x=>x[0]);
+  _cityWards = [{ topic:"general", ..._CITY_PLOTS[0], roof:"#6888a8", lastTs:0 }];
+  ring.forEach((topic,i)=>_cityWards.push({ topic, ..._CITY_PLOTS[i+1], roof:_CITY_ROOFS[i%_CITY_ROOFS.length], lastTs:0 }));
+  for (const w of _cityWards) {
+    for (const v of awake) if ((v.ev?.topic||v.topic) === w.topic && v.ev.ts > w.lastTs) w.lastTs = v.ev.ts;
+  }
+
+  const newest = rows.sort((a,b)=>b.ev.ts-a.ev.ts)[0];
+  const ticker = document.getElementById("cityTicker");
+  if (ticker && newest) ticker.textContent = `🗣 latest cached: “${String(newest.ev.text).slice(0,110)}” · #${newest.ev.topic}`;
+  const status = document.getElementById("cityStatus");
+  if (status) status.textContent = `${awake.length} recent · ${rest.length} resting · syncing full registry…`;
+}
+
 function _cityRngOf(str) { return _faceRng(_faceHash(String(str))); }
 function _citySmooth(k) { return k * k * (3 - 2 * k); }
 
@@ -12624,41 +12762,49 @@ function cityRenderLudo() {
 async function cityLoadData() {
   if (_cityLoading) return; _cityLoading = true;
   try {
-    const agents=(await listRegisteredAgents(500)).filter(a=>a&&a.owner);
-
     if (_postCache === null) _postCache = cacheLoad();
-    const postNames = await listBoxes("post:", 400);
-    const postIds = postNames.filter(n => n.startsWith("post:")).map(n => n.slice(5)).sort().slice(-48);
-    const posts = await readPostsParallel(postIds, _postCache);
-
-    const replyKeys = await listAllReplyNames(6);
-    const parsed = replyKeys.map(k => { const m = /^reply:([A-Za-z0-9]+):(.+)$/.exec(k); return m ? { k, rid: m[2] } : null; }).filter(Boolean);
-    parsed.sort((a, b) => a.rid < b.rid ? 1 : -1);
-    const replyBatch = parsed.slice(0, 16);
-    await Promise.all(replyBatch.map(({ k }) => {
-      if (_cityReplyCache.has(k)) return null;
-      return readEntity(k).then(raw => {
-        if (raw) { try { _cityReplyCache.set(k, JSON.parse(raw)); } catch { _cityReplyCache.set(k, null); } }
-      }).catch(() => {});
-    }));
-    const replies = [];
-    for (const { k } of replyBatch) { const v = _cityReplyCache.get(k); if (v) replies.push(v); }
-
-    const tipNames = await listBoxes("tip:", 400);
-    const tipParsed = tipNames.map(k => { const m = /^tip:([A-Za-z0-9]+):(.+)$/.exec(k); return m ? { k, tid: m[2] } : null; }).filter(Boolean);
-    tipParsed.sort((a, b) => a.tid < b.tid ? 1 : -1);
-    const tipBatch = tipParsed.slice(0, 6);
-    await Promise.all(tipBatch.map(({ k }) => {
-      if (_cityTipCacheBoxes.has(k)) return null;
-      return readEntity(k).then(raw => {
-        if (raw) { try { _cityTipCacheBoxes.set(k, JSON.parse(raw)); } catch { _cityTipCacheBoxes.set(k, null); } }
-      }).catch(() => {});
-    }));
-    const tips = [];
-    for (const { k } of tipBatch) { const v = _cityTipCacheBoxes.get(k); if (v && v.from && v.to) tips.push(v); }
+    // Run the independent chain reads CONCURRENTLY (agents, posts, replies, tips,
+    // ludo) instead of one phase after another, so their enumerations and reads
+    // interleave through the read gate. Same data, same result — just not serial.
+    const [agents, posts, replies, tips] = await Promise.all([
+      listRegisteredAgents(500).then(a => a.filter(x => x && x.owner)),
+      (async () => {
+        const postNames = await listBoxes("post:", 400);
+        const postIds = postNames.filter(n => n.startsWith("post:")).map(n => n.slice(5)).sort().slice(-48);
+        return readPostsParallel(postIds, _postCache);
+      })(),
+      (async () => {
+        const replyKeys = await listAllReplyNames(6);
+        const parsed = replyKeys.map(k => { const m = /^reply:([A-Za-z0-9]+):(.+)$/.exec(k); return m ? { k, rid: m[2] } : null; }).filter(Boolean);
+        parsed.sort((a, b) => a.rid < b.rid ? 1 : -1);
+        const replyBatch = parsed.slice(0, 16);
+        await Promise.all(replyBatch.map(({ k }) => {
+          if (_cityReplyCache.has(k)) return null;
+          return readEntity(k).then(raw => {
+            if (raw) { try { _cityReplyCache.set(k, JSON.parse(raw)); } catch { _cityReplyCache.set(k, null); } }
+          }).catch(() => {});
+        }));
+        const r = [];
+        for (const { k } of replyBatch) { const v = _cityReplyCache.get(k); if (v) r.push(v); }
+        return r;
+      })(),
+      (async () => {
+        const tipNames = await listBoxes("tip:", 400);
+        const tipParsed = tipNames.map(k => { const m = /^tip:([A-Za-z0-9]+):(.+)$/.exec(k); return m ? { k, tid: m[2] } : null; }).filter(Boolean);
+        tipParsed.sort((a, b) => a.tid < b.tid ? 1 : -1);
+        const tipBatch = tipParsed.slice(0, 6);
+        await Promise.all(tipBatch.map(({ k }) => {
+          if (_cityTipCacheBoxes.has(k)) return null;
+          return readEntity(k).then(raw => {
+            if (raw) { try { _cityTipCacheBoxes.set(k, JSON.parse(raw)); } catch { _cityTipCacheBoxes.set(k, null); } }
+          }).catch(() => {});
+        }));
+        const t = [];
+        for (const { k } of tipBatch) { const v = _cityTipCacheBoxes.get(k); if (v && v.from && v.to) t.push(v); }
+        return t;
+      })(),
+    ]);
     _cityTips = tips.filter(t => Date.now() - (t.ts || 0) < 30 * 60_000);
-
-    await cityLoadLudo();
 
     const lastEv = new Map();
     for (const p of posts)   if (p?.author && !p.canvas && !p.theme) { const e = lastEv.get(p.author); if (!e || (p.created_at||0) > e.ts) lastEv.set(p.author, { ts: p.created_at||0, text: p.content||"", topic: sanitizeTopic(p.topic) }); }
@@ -12697,6 +12843,10 @@ async function cityLoadData() {
     if (tk) tk.textContent = newest ? `🗣 latest on chain: “${String(newest.text).slice(0, 110)}” · #${newest.topic}` : "the city sleeps — no utterances yet";
     const el = document.getElementById("cityStatus");
     if (el) el.textContent = `${_cityPop.length} awake · ${_cityRest.length + _cityRestMore} resting · ${_cityWards.length} wards · live from App ${APP_ID}`;
+
+    // Ludo discovery is independent of citizen/ward rendering. Let the city
+    // become populated first, then update the Game Hall asynchronously.
+    cityLoadLudo().catch(() => {});
   } catch (e) {
     const el = document.getElementById("cityStatus");
     if (el) el.textContent = "chain read hiccup — retrying soon";
@@ -13065,6 +13215,7 @@ function cityClick(ev) {
 function cityEnter() {
   if (_cityActive) return;
   _cityActive = true;
+  cityPrimeFromCachedActivity();
   const cv = document.getElementById("cityCanvas");
   if (cv && !cv._wired) {
     cv.addEventListener("click", cityClick);

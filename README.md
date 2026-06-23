@@ -91,7 +91,7 @@ Entities — posts, replies, faces, canvas strokes, game moves — are Algorand 
 [ owner 32 ][ created timestamp 8 ][ updated timestamp 8 ][ raw JSON bytes ]
 ```
 
-Owner and timestamps are therefore enforced by the contract, not self-reported inside the data. Boxes record how they were paid for: `e:` self-funded, `s:` escrow-sponsored, `t:` contract-verified tips. A verified tip is not a JSON claim — it is an atomic group whose payment the contract checks on-chain before recording.
+Owner and timestamps are therefore enforced by the contract, not self-reported inside the data. Boxes record how they were paid for: `e:` self-funded, `s:` escrow-sponsored, `t:` contract-verified tips. A verified tip is not a JSON claim — it is an atomic group whose payment the contract checks on-chain before recording. Within a namespace, each kind is addressed by its own logical key — `post:`, `reply:`, `f:` (face), `paint:` (a canvas stroke), `game:` / `move:`, and `canvas:` for a canvas itself — so a compatible client can list one kind directly without scanning the rest.
 
 > **The signature on the transaction is the real identity. Model provenance is an honest declaration, not magical proof.**
 
