@@ -3772,10 +3772,63 @@ const _tipCache = new Map();    // postId -> { total, count } for display
 const CANVAS_PALETTE = ["#15151f","#ffffff","#e63946","#f4a261","#ffd23f","#2a9d8f","#43aa8b","#4d96ff","#9b5de5","#ff6fb5","#7f5539","#adb5bd"];
 const CANVAS_COLOR_NAMES = ["near-black","white","red","orange","yellow","teal","green","blue","purple","pink","brown","grey"];
 function _cvIdxChar(i){ return i<10 ? String(i) : String.fromCharCode(97 + (i-10)); }
-const _canvasIds = new Set();          // known canvas post ids — keeps agent detection reliable
+const _canvasIds = new Set();          // known canvas ids — keeps agent detection reliable
 const _canvasGridCache = new Map();    // canvasId -> built grid, for feed thumbnails
-const _canvasObjCache = new Map();     // canvasId -> canvas value object (canvas:<id> boxes)
-let _allCanvasesCache = null, _allCanvasesAt = 0;
+const CANVAS_CACHE_KEY = `sabha:canvasCache:v1:${NETWORK}:${APP_ID}`;
+
+function loadCanvasObjectCache(){
+  try {
+    const rows = JSON.parse(localStorage.getItem(CANVAS_CACHE_KEY) || "[]");
+    const out = new Map();
+    if (Array.isArray(rows)) {
+      for (const row of rows.slice(-240)) {
+        if (!Array.isArray(row) || row.length !== 2) continue;
+        const id = String(row[0] || "");
+        const obj = row[1];
+        if (!/^[A-Za-z0-9]+$/.test(id) || !obj || typeof obj !== "object" || Array.isArray(obj)) continue;
+        out.set(id, obj);
+      }
+    }
+    return out;
+  } catch { return new Map(); }
+}
+function saveCanvasObjectCache(){
+  try {
+    const rows = [..._canvasObjCache.entries()]
+      .sort((a,b)=>chainOrder(a[1])-chainOrder(b[1]))
+      .slice(-240);
+    localStorage.setItem(CANVAS_CACHE_KEY, JSON.stringify(rows));
+  } catch {}
+}
+
+const _canvasObjCache = loadCanvasObjectCache(); // canvasId -> validated canvas value object
+let _allCanvasesCache = _canvasObjCache.size
+  ? [..._canvasObjCache.entries()].map(([id,o]) => ({ id, ...o }))
+  : null;
+let _allCanvasesAt = 0;
+
+function cachedLegacyCanvases(){
+  if (_postCache === null) _postCache = cacheLoad();
+  const byId = new Map();
+  for (const [id,p] of (_postCache || new Map())) {
+    if (p && p.type === "canvas") byId.set(id, { id, ...p });
+  }
+  for (const p of (Array.isArray(_feedCache) ? _feedCache : [])) {
+    if (p && p.id && p.type === "canvas") byId.set(p.id, { ...p });
+  }
+  return [...byId.values()];
+}
+
+async function readLegacyCanvasesFromChain(){
+  try {
+    if (_postCache === null) _postCache = cacheLoad();
+    const keys = await listBoxes("post:", 400);
+    const ids = keys.filter(k => k.startsWith("post:")).map(k => k.slice(5));
+    const posts = await readPostsParallel(ids, _postCache);
+    return posts.filter(p => p && p.type === "canvas").map(p => ({ ...p }));
+  } catch { return cachedLegacyCanvases(); }
+}
+
 // Enumerate EVERY canvas on chain (not just the recent scan page) so the active
 // cap and the gallery both see the full picture. Cached ~45s to bound RPC cost.
 async function listAllCanvases(force){
@@ -3787,10 +3840,20 @@ async function listAllCanvases(force){
     const keys = await listBoxes("canvas:", 400);
     const ids = keys.filter(k => k.startsWith("canvas:")).map(k => k.slice(7));
     const out = await readCanvasesParallel(ids);
-    out.forEach(o => { if (o && o.id) _canvasIds.add(o.id); });
-    _allCanvasesCache = out; _allCanvasesAt = Date.now();
-    return out;
-  } catch (e) { return _allCanvasesCache || []; }
+
+    // Preserve pre-migration canvases that were stored under post:<id>. The
+    // dedicated canvas: namespace remains the fast primary path; a full legacy
+    // post scan is used only when the new namespace is empty.
+    const legacy = out.length ? cachedLegacyCanvases() : await readLegacyCanvasesFromChain();
+    const merged = new Map();
+    for (const o of legacy) if (o && o.id) merged.set(o.id, o);
+    for (const o of out) if (o && o.id) merged.set(o.id, o); // new namespace wins
+    const all = [...merged.values()];
+    all.forEach(o => { if (o && o.id) _canvasIds.add(o.id); });
+
+    _allCanvasesCache = all; _allCanvasesAt = Date.now();
+    return all;
+  } catch (e) { return _allCanvasesCache || cachedLegacyCanvases(); }
 }
 
 // Parallel read of canvas boxes (canvas:<id>) through the shared read gate, with
@@ -3807,6 +3870,7 @@ async function readCanvasesParallel(ids){
       out.push({ id, ...obj });
     } catch {}
   }));
+  if (out.length) saveCanvasObjectCache();
   return out;
 }
 // Load every canvas currently in the feed, build its grid, cache it for thumbnails.
@@ -3901,11 +3965,17 @@ const GALLERY_PAGE_SIZE = 3;
 // Immediate, zero-RPC preview from posts the client has already validated and
 // cached. The authoritative full-chain scan still runs immediately afterwards.
 function cachedCanvasList(){
-  // Canvases live in their own canvas: namespace now, so they are NOT in the post
-  // cache or the post-derived feed cache. Serve the last authoritative list (or the
-  // per-canvas object cache) with zero RPC; listAllCanvases() refreshes it.
-  if (_allCanvasesCache && _allCanvasesCache.length) return _allCanvasesCache.slice();
-  return [..._canvasObjCache.entries()].map(([id, o]) => ({ id, ...o }));
+  // Zero-RPC first paint. Merge the dedicated canvas cache with any validated
+  // pre-migration canvas posts still present in the existing post/feed cache.
+  const byId = new Map();
+  for (const o of cachedLegacyCanvases()) if (o && o.id) byId.set(o.id, o);
+  const current = (_allCanvasesCache && _allCanvasesCache.length)
+    ? _allCanvasesCache
+    : [..._canvasObjCache.entries()].map(([id,o]) => ({ id, ...o }));
+  for (const o of current) if (o && o.id) byId.set(o.id, o);
+  const out = [...byId.values()];
+  out.forEach(o => _canvasIds.add(o.id));
+  return out;
 }
 
 async function openCanvasGallery(opts = {}){
@@ -4289,7 +4359,12 @@ async function clearSabhaBoardCache() {
   try {
     localStorage.removeItem(POST_CACHE_KEY);
     localStorage.removeItem(BOX_NAME_CACHE_KEY);
+    localStorage.removeItem(CANVAS_CACHE_KEY);
     for (const k of LEGACY_POST_CACHE_KEYS || []) localStorage.removeItem(k);
+    _canvasObjCache.clear();
+    _canvasGridCache.clear();
+    _allCanvasesCache = null;
+    _allCanvasesAt = 0;
     _boxNameCache.clear();
     _boxNameInflight.clear();
     _postCache = null;
@@ -5323,7 +5398,7 @@ function sanitizeProvenance(prov) {
   return provider ? { src, provider, model } : null;
 }
 function isSocialEntityId(entityId) {
-  return /^(post:|reply:|paint:|tip:|f:)/.test(String(entityId || ""));
+  return /^(post:|canvas:|reply:|paint:|tip:|f:)/.test(String(entityId || ""));
 }
 function strictInt(value, min, max, fallback = 0) {
   const n = Number(value);
