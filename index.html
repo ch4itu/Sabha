@@ -12425,8 +12425,10 @@ const _CITY_HALL = { x: 29, y: 18 };                          // Game Hall plot
 let _cityGame = null;                                          // latest ludo {gid,box,moves,st}
 let _cityGamesIndex = [];                                      // all matches, newest first [{gid,box}]
 const _cityGameBoxCache = new Map();                           // gid -> game box (immutable once done)
-let _ludoSel = null;                                           // viewer selection {gid,box,moves}
+let _ludoSel = null;                                           // viewer selection {gid,box,moves,loading?}
 let _ludoStep = -1;                                            // replay position (-1 = live end)
+let _ludoLoading = false;                                      // a game-list load is in flight
+let _ludoLoaded = false;                                       // at least one game-list load has completed
 let _cityGameSet = new Set();                                  // addrs seated at the table
 const _cityMoveCache = new Map();                              // immutable move boxes
 const _CITY_ROOFS = ["#d04848","#4878d0","#e08830","#9858c8","#38a098","#d06890","#c8b030"];
@@ -12634,6 +12636,7 @@ async function ludoRoll(gid, n, seedB64) {
 
 // ── Game Hall data: latest ludo table, folded from immutable move boxes ──────
 async function cityLoadLudo() {
+  _ludoLoading = true;
   try {
     const names = await listBoxes("game:", 200);
     const ids = names.filter(n => n.startsWith("game:")).map(n => n.slice(5)).sort().reverse();
@@ -12646,22 +12649,34 @@ async function cityLoadLudo() {
     const idx = [];
     for (const gid of ids) { const g = _cityGameBoxCache.get(gid); if (g && g.kind === "ludo") idx.push({ gid, box: g }); }
     _cityGamesIndex = idx;                                     // newest first
-    if (idx.length === 0) { _cityGame = null; _cityGameSet = new Set(); return; }
+    const modalOpen = () => document.getElementById("ludoModal")?.style.display === "block";
+    if (idx.length === 0) {
+      _cityGame = null; _cityGameSet = new Set();
+      if (modalOpen()) cityRenderLudo();                      // loading done → show "no match yet", not "loading…"
+      return;
+    }
     // newest match drives the city (who stands at the Hall)
     const newest = idx[0];
     const moves = await cityLoadGameMoves(newest.gid);
     _cityGame = { gid: newest.gid, box: newest.box, moves, st: ludoFold(newest.box.players, moves) };
     const live = _cityGame.st.winner === null && Date.now() - (newest.box.ts || 0) < 24 * 3600_000;
     _cityGameSet = live ? new Set(newest.box.players) : new Set();
-    // live viewer following the end: refresh it
-    const open = document.getElementById("ludoModal")?.style.display === "block";
-    if (open && _ludoSel && _ludoSel.gid === newest.gid) {
-      const atEnd = _ludoStep < 0 || _ludoStep >= _ludoSel.moves.length;
-      _ludoSel.moves = moves;
-      if (atEnd) _ludoStep = -1;
-      cityRenderLudo();
+    // viewer open: if nothing is selected yet (modal was opened before the list
+    // finished loading) pick the newest match; if a live match is showing, refresh it.
+    if (modalOpen()) {
+      if (!_ludoSel) {
+        ludoSelectGame(newest.gid);
+      } else if (_ludoSel.gid === newest.gid) {
+        const atEnd = _ludoStep < 0 || _ludoStep >= _ludoSel.moves.length;
+        _ludoSel.moves = moves;
+        if (atEnd) _ludoStep = -1;
+        cityRenderLudo();
+      } else {
+        cityRenderLudo();
+      }
     }
   } catch { /* keep previous */ }
+  finally { _ludoLoading = false; _ludoLoaded = true; }
 }
 async function cityLoadGameMoves(gid) {
   const moveNames = (await listBoxes(`move:${gid}:`, 300)).sort();
@@ -12679,7 +12694,14 @@ async function cityLoadGameMoves(gid) {
 async function ludoSelectGame(gid) {
   const entry = _cityGamesIndex.find(e => e.gid === gid) || _cityGamesIndex[0];
   if (!entry) return;
-  _ludoSel = { gid: entry.gid, box: entry.box, moves: await cityLoadGameMoves(entry.gid) };
+  // Reading a match's move boxes can take a moment — paint a "loading match…"
+  // state immediately so switching matches gives feedback instead of a freeze.
+  _ludoSel = { gid: entry.gid, box: entry.box, moves: [], loading: true };
+  _ludoStep = -1;
+  cityRenderLudo();
+  const moves = await cityLoadGameMoves(entry.gid);
+  if (!_ludoSel || _ludoSel.gid !== entry.gid) return;        // user switched again mid-load — don't clobber
+  _ludoSel = { gid: entry.gid, box: entry.box, moves };
   _ludoStep = -1;
   cityRenderLudo();
 }
@@ -12723,9 +12745,16 @@ function cityOpenLudo() {
     document.body.appendChild(m);
   }
   m.style.display = "block";
-  if (_cityGamesIndex.length && (!_ludoSel || !_cityGamesIndex.some(e => e.gid === _ludoSel.gid))) {
-    ludoSelectGame(_cityGamesIndex[0].gid);
-  } else cityRenderLudo();
+  if (_cityGamesIndex.length) {
+    if (!_ludoSel || !_cityGamesIndex.some(e => e.gid === _ludoSel.gid)) ludoSelectGame(_cityGamesIndex[0].gid);
+    else cityRenderLudo();
+  } else {
+    // Games may simply not be loaded yet — paint a loading state (cityRenderLudo
+    // reads _ludoLoaded/_ludoLoading) and pull them in; cityLoadLudo's tail opens
+    // the newest match once the list arrives, instead of flashing "no match yet".
+    cityRenderLudo();
+    if (!_ludoLoading) cityLoadLudo();
+  }
 }
 // classic 15×15 cross geometry — verified LUT (52 unique cells, classic starts)
 const _LUDO_LUT = [[1,6],[2,6],[3,6],[4,6],[5,6],[6,5],[6,4],[6,3],[6,2],[6,1],[6,0],[7,0],[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[9,6],[10,6],[11,6],[12,6],[13,6],[14,6],[14,7],[14,8],[13,8],[12,8],[11,8],[10,8],[9,8],[8,9],[8,10],[8,11],[8,12],[8,13],[8,14],[7,14],[6,14],[6,13],[6,12],[6,11],[6,10],[6,9],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8],[0,7],[0,6]];
@@ -12757,9 +12786,18 @@ function cityRenderLudo() {
       const d = e.box.ts ? new Date(e.box.ts).toISOString().slice(0, 10) : "?";
       return `<option value="${e.gid}">${d} · ${(e.box.names || []).map(escapeHTML).join(" vs ")}</option>`;
     }).join("");
-    if (_ludoSel) pick.value = _ludoSel.gid;
   }
-  if (!_ludoSel) { g.fillStyle = "#8a98a8"; g.font = "12px monospace"; g.textAlign = "center"; g.fillText("no match yet — a citizen will open a table", 150, 150); side.innerHTML = ""; return; }
+  if (pick && _ludoSel && pick.value !== _ludoSel.gid) pick.value = _ludoSel.gid;  // keep dropdown synced to selection
+  const _ludoMsg = (msg) => { g.fillStyle = "#8a98a8"; g.font = "12px monospace"; g.textAlign = "center"; g.fillText(msg, 150, 150); };
+  if (!_ludoSel) {
+    // Distinguish "list still loading" from "genuinely no games".
+    _ludoMsg((!_ludoLoaded || _ludoLoading) ? "loading games…" : "no match yet — a citizen will open a table");
+    side.innerHTML = ""; return;
+  }
+  if (_ludoSel.loading) {                                      // a specific match is being fetched
+    _ludoMsg("loading match…");
+    side.innerHTML = "<span class='dim' style='font-size:11px;'>loading this match from chain…</span>"; return;
+  }
   const { box, gid } = _ludoSel;
   const allMoves = _ludoSel.moves;
   const upto = _ludoStep < 0 ? allMoves.length : Math.min(_ludoStep, allMoves.length);
