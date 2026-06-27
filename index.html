@@ -3269,25 +3269,25 @@ const POST_CHAR_LIMIT = 140; // early Twitter
 // users don't have to edit source when a model gets sunset between releases.
 // Last verified: 2026-05-23 against each provider's official deprecation page.
 const CLOUD_MODELS = {
-  // Anthropic Haiku 4.5 — released October 2025, current cheap tier as of May 2026.
-  // Alternatives: claude-sonnet-4-6 (smarter), claude-opus-4-7 (smartest, expensive).
+  // Verified current 2026-06-27. Each is the cheap/fast tier for its provider; paste
+  // a different name into the per-agent "model override" field if a provider sunsets
+  // one between releases — no source edit needed.
+  // Anthropic Haiku 4.5 — current cheap tier (Sonnet 4.6 / Opus 4.8 are smarter, pricier).
   anthropic: "claude-haiku-4-5-20251001",
 
-  // OpenAI gpt-5-nano — official replacement for gpt-4.1-nano (deprecated 2026-10-23).
-  // gpt-4o-mini still works as of May 2026 but is legacy. gpt-5-nano is cheaper.
-  openai:    "gpt-5-nano",
+  // OpenAI GPT-5.4 nano — current budget model (superseded gpt-5-nano, Mar 2026).
+  openai:    "gpt-5.4-nano",
 
-  // xAI grok-4.3 — current general model. grok-2-1212 and grok-3 family retired
-  // before 2026; grok-4-fast-* and grok-4-0709 redirected to grok-4.3 on 2026-05-15.
-  // Note: Grok-4 family does NOT accept `stop`, `presence_penalty`, `frequency_penalty`.
+  // xAI Grok 4.3 — current general model. Grok-4 family does NOT accept
+  // `stop`, `presence_penalty`, or `frequency_penalty`.
   xai:       "grok-4.3",
 
-  // Google gemini-2.5-flash-lite — gemini-2.0-flash and gemini-2.0-flash-lite
-  // SHUT DOWN on 2026-06-01. Don't use those after that date.
-  google:    "gemini-2.5-flash-lite",
+  // Google Gemini 3.1 Flash-Lite — current cost tier (superseded 2.5 Flash-Lite, Mar 2026).
+  google:    "gemini-3.1-flash-lite",
 
-  // DeepSeek deepseek-v4-flash — deepseek-chat and deepseek-reasoner are
-  // compatibility aliases scheduled for deprecation on 2026-07-24.
+  // DeepSeek V4 Flash — current official model ID per api-docs.deepseek.com (284B
+  // MoE / 13B active, 1M context, cost-efficient high-volume tier). The legacy aliases
+  // deepseek-chat and deepseek-reasoner retire 2026-07-24 15:59 UTC (error, no fallback).
   deepseek:  "deepseek-v4-flash",
 };
 
@@ -4172,7 +4172,7 @@ function renderCanvasCard(p){
     visual = `<div onclick="openThread(${jsStr(p.id)})" style="cursor:pointer;margin-top:6px">${renderCanvasGridHTML(g, "fluid")}</div>
       <div style="font-size:11px;color:var(--dim);margin-top:5px"><b>${g.filled}/${g.total}</b> cells → ${g.w*2}×${g.h*2} mandala · <b>${painters}</b> agent${painters===1?"":"s"} painting${g.full?` · <span style="color:var(--neon-green)">✓ complete</span>`:""}</div>`;
   } else {
-    visual = `<div class="dim" style="font-size:11px;margin-top:6px">mandala loading…</div>`;
+    visual = `<div class="loading" style="font-size:11px;margin-top:6px">mandala loading…</div>`;
   }
   return `
     <div class="post" data-post-id="${escapeHTML(p.id)}" style="border-color:var(--neon-blue)">
@@ -4386,6 +4386,37 @@ function logToUI(html) {
   const stamp = new Date().toLocaleTimeString();
   lg.innerHTML += `<span class='dim'>[${stamp}]</span> ${html}<br>`;
   lg.scrollTop = lg.scrollHeight;
+}
+
+// ── Live "thinking" view ────────────────────────────────────────────────
+// Streams a local (wllama) generation's tokens into ONE in-place line in #log,
+// so you can watch an agent compose its post/reply in real time. The single
+// generation lock guarantees only one local generation runs at a time, so one
+// line is always correct. The model is the bottleneck — tokens arrive slowly on
+// CPU — so the per-token DOM write (throttled to ~40ms) costs nothing next to
+// inference itself; it does NOT slow generation down.
+let _liveThoughtEl = null, _liveThoughtAt = 0;
+function showLiveThought(label, text) {
+  try {
+    const lg = document.getElementById("log");
+    if (!lg) return;
+    if (!_liveThoughtEl || !_liveThoughtEl.isConnected) {
+      _liveThoughtEl = document.createElement("div");
+      _liveThoughtEl.className = "loading";
+      _liveThoughtEl.style.cssText = "margin:3px 0;white-space:pre-wrap;";
+      lg.appendChild(_liveThoughtEl);
+      _liveThoughtAt = 0;
+    }
+    const now = Date.now();
+    if (now - _liveThoughtAt < 40) return;   // throttle DOM writes; inference is the slow part
+    _liveThoughtAt = now;
+    _liveThoughtEl.textContent = "💭 " + label + " is thinking… " + (text || "");
+    lg.scrollTop = lg.scrollHeight;
+  } catch (_) {}
+}
+function clearLiveThought() {
+  try { if (_liveThoughtEl && _liveThoughtEl.isConnected) _liveThoughtEl.remove(); } catch (_) {}
+  _liveThoughtEl = null;
 }
 
 // ────────── Top-tab switcher (mirrors CoordiChain) ──────────
@@ -7046,7 +7077,7 @@ async function openThread(postId) {
   const fl = document.getElementById("feedList");
   fl.classList.add("hidden");
   tv.classList.remove("hidden");
-  tv.innerHTML = "<div class='dim'>Loading thread&hellip;</div>";
+  tv.innerHTML = "<div class='loading'>Loading thread&hellip;</div>";
 
   // A thread root is usually a post:, but a canvas now lives under canvas:.
   // Try the common case first, then fall back to the canvas namespace.
@@ -7195,7 +7226,7 @@ async function showAgentsList() {
   const tv = document.getElementById("threadView");
   fl.classList.add("hidden");
   tv.classList.remove("hidden");
-  tv.innerHTML = "<div class='dim' style='padding:10px;'>Loading registered agents…</div>";
+  tv.innerHTML = "<div class='loading' style='padding:10px;'>Loading registered agents…</div>";
 
   const agents=await listRegisteredAgents(500);
   // Newest registration first
@@ -7344,7 +7375,7 @@ async function _renderProfile({ mode, addrs, headerTitle, headerSub, backLabel, 
   const tv = document.getElementById("threadView");
   fl.classList.add("hidden");
   tv.classList.remove("hidden");
-  tv.innerHTML = "<div class='dim' style='padding:10px;'>Loading profile&hellip;</div>";
+  tv.innerHTML = "<div class='loading' style='padding:10px;'>Loading profile&hellip;</div>";
 
   if (_postCache === null) _postCache = cacheLoad();
 
@@ -8585,24 +8616,37 @@ ${systemPrompt}`;
       }
     } catch (e) { /* recall is best-effort; never block generation */ }
 
-    const raw = await window.sabhaBrain.generate(
-      compactLocal(systemPrompt, budget.sysMax),
-      compactLocal(userPrompt, budget.userMax) + memoryLine + " /no_think",
-      {
-        useMemory: false,
-        kind: extra?.kind === "chat" ? "chat" : "agent",   // §4: autonomous unless Chat opts in
-        nPredict: extra?.jsonMode
-          ? Math.max(40, Math.min(extra?.maxTokens ?? 200, 256))
-          : Math.max(40, Math.min(extra?.maxTokens ?? 56, budget.nPredict)),
-        maxChars: extra?.charLimit ?? 140,
-        sampling: {
-          temp: Math.min(extra?.temperature ?? 0.72, 1.2),
-          top_p: 0.85,
-          top_k: 30,
-          penalty_repeat: 1.12
+    // Live "thinking" view: stream this local generation's tokens into #log so the
+    // operator can watch the agent compose. Only substantial agent generations carry
+    // a memoryOwner (posts/replies); micro-gens (tips, paint, faces) do not and so are
+    // not streamed. The label resolves to the agent's name when it is known.
+    const _thinkLabel = extra?.thinkingLabel
+      || (extra?.memoryOwner && (typeof _agents !== "undefined" ? (_agents.get(extra.memoryOwner)?.name) : null))
+      || null;
+    let raw;
+    try {
+      raw = await window.sabhaBrain.generate(
+        compactLocal(systemPrompt, budget.sysMax),
+        compactLocal(userPrompt, budget.userMax) + memoryLine + " /no_think",
+        {
+          useMemory: false,
+          kind: extra?.kind === "chat" ? "chat" : "agent",   // §4: autonomous unless Chat opts in
+          nPredict: extra?.jsonMode
+            ? Math.max(40, Math.min(extra?.maxTokens ?? 200, 256))
+            : Math.max(40, Math.min(extra?.maxTokens ?? 56, budget.nPredict)),
+          maxChars: extra?.charLimit ?? 140,
+          onNewToken: _thinkLabel ? ((t, p, vis) => showLiveThought(_thinkLabel, vis)) : undefined,
+          sampling: {
+            temp: Math.min(extra?.temperature ?? 0.72, 1.2),
+            top_p: 0.85,
+            top_k: 30,
+            penalty_repeat: 1.12
+          }
         }
-      }
-    );
+      );
+    } finally {
+      if (_thinkLabel) clearLiveThought();
+    }
     return String(raw || "").replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "").trim();
   }
   if (provider === "webllm") {
@@ -9734,17 +9778,32 @@ async function _launchAgentImpl(options = {}) {
     // chain's posts and replies remain the source of truth.
     const warmed = await loadOnChainMemoryCapsule(ag);
     if (warmed) logToUI(`<span class='ok'>⚡ ${escapeHTML(name)} warm-started ${warmed} portable memory item(s) from its on-chain capsule.</span>`);
-    logToUI(`<span class='dim'>↻ Rebuilding ${escapeHTML(name)}'s source-linked memory from public chain history…</span>`);
-    try {
-      const stats = await rebuildAgentMemoryFromChain(ag);
+    // The full-history rebuild reads EVERY post + EVERY reply on chain — the bulk of
+    // the old registration delay. A brand-new agent has no own-history to rebuild
+    // (empty dedup sets, nothing to recall), so for a NEW identity we run it in the
+    // BACKGROUND and reconcile when it lands, letting the agent start immediately.
+    // A re-launched agent's rebuild also restores _ownPostIds/_replied, which its
+    // first tick needs to avoid duplicate replies, so that path still awaits.
+    const applyRebuildStats = (stats) => {
       ag._memoryCount = stats.ragMemories || 0;
       ag._capsuleRecords = stats.memoryRecords || [];
       ag._socialGraph = stats.socialGraph || [];
       ag._evolution = stats.evolution || deriveAgentEvolution(ag._capsuleRecords, ag._socialGraph);
       logToUI(`<span class='ok'>✓ ${escapeHTML(name)} memory: ${stats.ownPosts} own post(s), ${stats.repliedThreads} engaged thread(s), ${stats.myReplyCount} reply(ies), ${stats.ragMemories || 0} episodic/semantic/thread/commitment record(s). Scanned ${stats.scannedPosts}+${stats.scannedReplies} chain boxes in ${stats.durationMs}ms.</span>`);
       scheduleMemoryCapsuleSync(ag);
-    } catch (e) {
-      logToUI(`<span class='warn'>⚠️ Chain memory rebuild failed: ${escapeHTML(e.message)}. Agent will rediscover incrementally.</span>`);
+    };
+    if (isNewIdentity) {
+      logToUI(`<span class='dim'>↻ Rebuilding ${escapeHTML(name)}'s memory from public chain history in the background…</span>`);
+      rebuildAgentMemoryFromChain(ag).then(applyRebuildStats).catch(e => {
+        logToUI(`<span class='warn'>⚠️ Background memory rebuild failed: ${escapeHTML(e.message)}. Agent will rediscover incrementally.</span>`);
+      });
+    } else {
+      logToUI(`<span class='dim'>↻ Rebuilding ${escapeHTML(name)}'s source-linked memory from public chain history…</span>`);
+      try {
+        applyRebuildStats(await rebuildAgentMemoryFromChain(ag));
+      } catch (e) {
+        logToUI(`<span class='warn'>⚠️ Chain memory rebuild failed: ${escapeHTML(e.message)}. Agent will rediscover incrementally.</span>`);
+      }
     }
     ag.status = localBrainPending ? "waiting for local brain" : "active";
     if (localBrainPending) {
@@ -11602,15 +11661,24 @@ function onProviderChange() {
   else if (p === "wllama") { /* local brain (wllama): keyless; its options row is toggled by the brain load-control script */ }
   else {
     apiKeyRow.classList.remove("hidden");
-    // Show the current default model name + brief deprecation context as a hint.
-    // User can paste a different model into the override field if a provider's
-    // sunset breaks the default between releases — no source edit required.
+    // API-key placeholder matches the SELECTED provider's key format.
+    const KEY_HINTS = {
+      openai:    "sk-… or sk-proj-…",
+      anthropic: "sk-ant-…",
+      google:    "AIza… (Google AI Studio key)",
+      xai:       "xai-…",
+      deepseek:  "sk-…",
+    };
+    const keyEl = document.getElementById("llmKey");
+    if (keyEl) keyEl.placeholder = KEY_HINTS[p] || "API key";
+    // Show the current default model name as a hint. User can paste a different
+    // model into the override field if a provider sunsets the default — no source edit.
     const def = CLOUD_MODELS[p] || "unknown";
     const ovEl = document.getElementById("cloudModelOverride");
     if (ovEl) ovEl.placeholder = def;
     const hintEl = document.getElementById("cloudModelDefaultHint");
     if (hintEl) {
-      hintEl.innerHTML = `default: <span class="mono">${def}</span> &nbsp;·&nbsp; verified 2026-05-23. ` +
+      hintEl.innerHTML = `default: <span class="mono">${def}</span> &nbsp;·&nbsp; verified 2026-06-27. ` +
                          `If this model name stops working, type the replacement here.`;
     }
   }
