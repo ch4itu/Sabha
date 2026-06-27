@@ -4389,34 +4389,40 @@ function logToUI(html) {
 }
 
 // ── Live "thinking" view ────────────────────────────────────────────────
-// Streams a local (wllama) generation's tokens into ONE in-place line in #log,
-// so you can watch an agent compose its post/reply in real time. The single
-// generation lock guarantees only one local generation runs at a time, so one
-// line is always correct. The model is the bottleneck — tokens arrive slowly on
-// CPU — so the per-token DOM write (throttled to ~40ms) costs nothing next to
+// Streams a local (wllama) generation's tokens into a FIXED floating bar so you
+// can watch an agent compose its post/reply from any tab (the Log panel is
+// hidden unless its tab is active, so we pin this to the viewport instead). The
+// single generation lock guarantees only one local generation runs at a time, so
+// one bar is always correct. The model is the bottleneck — tokens arrive slowly
+// on CPU — so the per-token DOM write (throttled ~40ms) costs nothing next to
 // inference itself; it does NOT slow generation down.
-let _liveThoughtEl = null, _liveThoughtAt = 0;
+let _liveThoughtAt = 0;
 function showLiveThought(label, text) {
   try {
-    const lg = document.getElementById("log");
-    if (!lg) return;
-    if (!_liveThoughtEl || !_liveThoughtEl.isConnected) {
-      _liveThoughtEl = document.createElement("div");
-      _liveThoughtEl.className = "loading";
-      _liveThoughtEl.style.cssText = "margin:3px 0;white-space:pre-wrap;";
-      lg.appendChild(_liveThoughtEl);
+    let el = document.getElementById("__liveThought");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "__liveThought";
+      el.style.cssText = [
+        "position:fixed", "left:50%", "transform:translateX(-50%)", "bottom:16px",
+        "max-width:min(680px,92vw)", "max-height:30vh", "overflow:auto", "z-index:99999",
+        "padding:10px 14px", "border-radius:10px", "background:rgba(8,12,20,0.93)",
+        "border:1px solid rgba(90,200,255,0.55)", "box-shadow:0 0 20px rgba(90,200,255,0.28)",
+        "color:#bfe9ff", "font:13px/1.45 ui-monospace,Menlo,Consolas,monospace",
+        "white-space:pre-wrap", "pointer-events:none", "backdrop-filter:blur(2px)"
+      ].join(";");
+      document.body.appendChild(el);
       _liveThoughtAt = 0;
     }
     const now = Date.now();
     if (now - _liveThoughtAt < 40) return;   // throttle DOM writes; inference is the slow part
     _liveThoughtAt = now;
-    _liveThoughtEl.textContent = "💭 " + label + " is thinking… " + (text || "");
-    lg.scrollTop = lg.scrollHeight;
+    el.textContent = "💭 " + label + " is thinking… " + (text || "");
   } catch (_) {}
 }
 function clearLiveThought() {
-  try { if (_liveThoughtEl && _liveThoughtEl.isConnected) _liveThoughtEl.remove(); } catch (_) {}
-  _liveThoughtEl = null;
+  try { const el = document.getElementById("__liveThought"); if (el) el.remove(); } catch (_) {}
+  _liveThoughtAt = 0;
 }
 
 // ────────── Top-tab switcher (mirrors CoordiChain) ──────────
