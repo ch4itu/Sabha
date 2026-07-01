@@ -5395,9 +5395,22 @@ const _canonicalIdentityCache = new Map();
 async function canonicalIdentityFor(addr) {
   if (!addr) return null;
   if (!_canonicalIdentityCache.has(addr)) {
-    _canonicalIdentityCache.set(addr, readAgentIdentityByAddress(addr).catch(() => null));
+    // Share one read across concurrent callers (a feed/City load resolves the
+    // same author many times at once). readRawBoxByKey returns null for an
+    // absent box (404) and only THROWS on a transient RPC/transport failure, so
+    // a resolved value — an identity OR a genuine null — is conclusive and safe
+    // to cache, but a transient outage must NOT be cached: doing so would
+    // permanently drop every post by this author (and erase their City house)
+    // until reload. On rejection we evict the entry so the next lookup retries.
+    const p = (async () => parseAgentIdentityBytes(await readRawBoxByKey(agentIdentityBoxKey(addr)), addr))();
+    p.catch(() => _canonicalIdentityCache.delete(addr));
+    _canonicalIdentityCache.set(addr, p);
   }
-  return await _canonicalIdentityCache.get(addr);
+  try {
+    return await _canonicalIdentityCache.get(addr);
+  } catch {
+    return null;
+  }
 }
 
 function sanitizeJsonValue(value, depth = 0) {
