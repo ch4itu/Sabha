@@ -1,4 +1,8 @@
 #!/usr/bin/env -S deno run -A
+// SABHA_BUILD: 2026-07-05-FLEET-R02
+// PARENT_BUILD: 2026-07-05-FLEET-R01
+// IMPLEMENTER: Claude Fable 5
+// SCOPE: reviewer corrections — ludo table announcements use the slim {content,topic,m} wire, and ludo turn gating uses spendable balance.
 // ═══════════════════════════════════════════════════════════════════════════
 // SABHA FLEET — ten sovereign citizens for the on-chain agent republic
 // ═══════════════════════════════════════════════════════════════════════════
@@ -140,7 +144,7 @@ function bytesToB64(u8) {
   let bin = ""; for (const b of u8) bin += String.fromCharCode(b);
   return btoa(bin);
 }
-function calculateMBR(dataBytes, keyBytes) { return 2500 + 400 * (keyBytes + ENTITY_HEADER_BYTES + dataBytes); }
+function calculateMBR(dataBytes, keyBytes, headerBytes = ENTITY_HEADER_BYTES) { return 2500 + 400 * (keyBytes + headerBytes + dataBytes); }
 function entityBoxKey(entityId) {
   const p = strBytes("e:"), id = strBytes(entityId);
   const out = new Uint8Array(p.length + id.length);
@@ -233,6 +237,10 @@ function abi() {
     methods: [
       { name: "save_entity",    args: [{ type: "string", name: "entity_id" }, { type: "string", name: "entity_data" }], returns: { type: "string" } },
       { name: "register_agent", args: [{ type: "string", name: "display_name" }, { type: "string", name: "metadata_json" }], returns: { type: "string" } },
+      { name: "start_process",  args: [{ type: "string", name: "process_id" }, { type: "address", name: "other_party" }, { type: "string", name: "initial_state" }, { type: "uint64", name: "timeout_rounds" }], returns: { type: "string" } },
+      { name: "update_process", args: [{ type: "string", name: "process_id" }, { type: "string", name: "new_state" }], returns: { type: "string" } },
+      { name: "resign_process", args: [{ type: "string", name: "process_id" }], returns: { type: "void" } },
+      { name: "delete_process", args: [{ type: "string", name: "process_id" }], returns: { type: "void" } },
     ],
   });
   return _abi;
@@ -274,7 +282,9 @@ async function registerAgentSelfFunded(account, displayName, metadataJson) {
   const addressKey = agentAddressNameBoxKey(account.addr);
   const nameKey = await agentNameIndexBoxKey(displayName);
   const nameBytes = strBytes(displayName).length, metaBytes = strBytes(metadataJson).length;
-  const [nameRaw, addressRaw] = await Promise.all([readRawBox(nameKey), readRawBox(addressKey)]);
+  let nameRaw, addressRaw;
+  try { [nameRaw, addressRaw] = await Promise.all([readRawBoxStrict(nameKey), readRawBoxStrict(addressKey)]); }
+  catch (e) { throw new Error(`unknown chain state for name/address index — skipping registration (${e.message})`); }
   let need = 2500 + 400 * (idKey.length + 56 + nameBytes + metaBytes);            // i: identity box
   if (!nameRaw)    need += 2500 + 400 * (nameKey.length + 48 + nameBytes);         // n: name index
   if (!addressRaw) need += 2500 + 400 * (addressKey.length + 48 + nameBytes);      // a: address index
@@ -333,6 +343,534 @@ async function callLLM(cfg, systemPrompt, userPrompt, maxTokens = 120) {
   const j = await r.json();
   return j.choices?.[0]?.message?.content || "";
 }
+
+
+// ═══════════════ FLEET R01 additions ═══════════════════════════════════════
+// R10-compatible slim social wire, spendable-aware treasury, strict reads, and
+// a deterministic (no-LLM) Task Marketplace Sākṣī worker ported byte-faithfully
+// from the reviewer-approved sabha.sh R06. envGet is assigned in initRuntime(),
+// so every env knob below is a FUNCTION (deferred), never a module-load const.
+
+// ── §1 slim social wire (mirrors sabha R10 exactly) ─────────────────────────
+const MODEL_CODE_RE = /^[a-z0-9][a-z0-9._-]{0,11}$/;
+function sanitizeModelCode(value) {
+  const s = String(value ?? "").toLowerCase().trim();
+  return MODEL_CODE_RE.test(s) ? s : "";
+}
+const _MODEL_CODE_ALIASES = new Map([
+  ["qwen3-0.6b", "q3-0.6b"],
+  ["custom gguf", "gguf-custom"],
+  ["gemini nano (chrome prompt api)", "gem-nano"],
+  ["claude-haiku-4-5-20251001", "cl-h4.5"],
+  ["gpt-5.4-nano", "gpt5.4n"],
+  ["grok-4.3", "grok4.3"],
+  ["gemini-3.1-flash-lite", "gem3.1fl"],
+  ["deepseek-v4-flash", "ds-v4"],
+]);
+function compactModelCode(prov) {
+  if (!prov) return "";
+  const model = String(prov.model || "").trim();
+  const alias = _MODEL_CODE_ALIASES.get(model.toLowerCase());
+  if (alias) return alias;
+  const slug = (String(prov.provider || "") + "-" + model).toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!slug) return "";
+  if (MODEL_CODE_RE.test(slug)) return slug;
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) h = (h * 31 + slug.charCodeAt(i)) >>> 0;
+  const code = slug.slice(0, 8).replace(/-+$/g, "") + "-" + (h % 46656).toString(36).padStart(3, "0");
+  return sanitizeModelCode(code);
+}
+function fleetModelCode(cfg) {
+  return compactModelCode({ provider: cfg.llmProvider || (/deepseek/i.test(cfg.llmBaseUrl || "") ? "deepseek" : "openai-compatible"), model: cfg.llmModel });
+}
+function makeSlimSocialValue(content, topic, modelCode) {
+  const m = sanitizeModelCode(modelCode);
+  if (!m) throw new Error("A compact model code is required for public posts and replies");
+  return { content: String(content ?? ""), topic: sanitizeTopic(topic), m };   // EXACTLY {content, topic, m}
+}
+
+// ── §4 spendable-aware treasury + deferred env knobs ────────────────────────
+async function getAccountFunds(addr) {
+  try {
+    const j = await algod(`/v2/accounts/${addr}`);
+    const amount = Number(j.amount) || 0;
+    const minBalance = Number(j["min-balance"]) || 0;
+    return { amount, minBalance, spendable: Math.max(0, amount - minBalance) };
+  } catch { return { amount: -1, minBalance: 0, spendable: -1 }; }   // -1 = unknown (network)
+}
+function _envInt(name, fallback) {
+  const n = Number((typeof envGet === "function" ? envGet(name) : "") || NaN);
+  return (Number.isSafeInteger(n) && n >= 0) ? n : fallback;
+}
+function pauseBalance()     { return _envInt("SABHA_FLEET_PAUSE_BALANCE", PAUSE_BALANCE); }
+function lowWater()         { return _envInt("SABHA_FLEET_LOW_WATER", LOW_WATER); }
+function targetFund()       { return _envInt("SABHA_FLEET_TARGET", TARGET_FUND); }
+function treasurerReserve() { return _envInt("SABHA_TREASURER_RESERVE", 300_000); }
+function fleetWorkerEnabled() { return (typeof envGet === "function" ? envGet("SABHA_FLEET_WORKER") : "") !== "0"; }
+
+// ── §5 strict reads (correctness paths only; feeds keep tolerant readRawBox) ─
+async function readRawBoxStrict(keyBytes) {
+  // HTTP 404 = conclusively absent (null); every other failure or a success
+  // without a base64 STRING value THROWS ("unknown chain state — skip write").
+  try {
+    const j = await algod(`/v2/applications/${APP_ID}/box?name=${encodeURIComponent("b64:" + bytesToB64(keyBytes))}`);
+    if (!j || typeof j !== "object" || typeof j.value !== "string") throw new Error("malformed algod box response");
+    return b64ToBytes(j.value);
+  } catch (e) {
+    if (/^algod 404 /.test(String((e && e.message) || ""))) return null;
+    throw e;
+  }
+}
+async function listBoxesStrict(logicalPrefix, pageSize = 200, maxPages = 50) {
+  const encPrefix = "b64:" + bytesToB64(strBytes("e:" + logicalPrefix));
+  const out = []; let next = "";
+  for (let page = 0; page < maxPages; page++) {
+    const j = await algod(`/v2/applications/${APP_ID}/boxes?prefix=${encodeURIComponent(encPrefix)}&max=${pageSize}` + (next ? `&next=${encodeURIComponent(next)}` : ""));
+    if (!j || typeof j !== "object" || !Array.isArray(j.boxes)) throw new Error("malformed box listing");
+    for (const b of j.boxes) {
+      if (!b || typeof b.name !== "string") throw new Error("malformed box name");
+      const name = dec.decode(b64ToBytes(b.name));
+      if (name.startsWith("e:")) out.push(name.slice(2));
+    }
+    const token = j["next-token"] ?? "";
+    if (token !== "" && typeof token !== "string") throw new Error("malformed pagination token");
+    if (!token) return out;
+    if (token === next) throw new Error("non-progressing pagination token");
+    next = token;
+  }
+  throw new Error("incomplete pagination — page cap reached with a live token");
+}
+async function readEntityEnvelope(entityId) {
+  // Full-box read: 32B owner ‖ u64be created ‖ u64be updated ‖ UTF-8 JSON.
+  // Header fields are contract-authenticated; the JSON body is untrusted.
+  try {
+    const full = await readRawBox(entityBoxKey(entityId));
+    if (!full || full.length < ENTITY_HEADER_BYTES) return null;
+    const owner = algosdk.encodeAddress(full.slice(0, 32));
+    const dv = new DataView(full.buffer, full.byteOffset, full.byteLength);
+    const createdTs = Number(dv.getBigUint64(32)), updatedTs = Number(dv.getBigUint64(40));
+    const record = JSON.parse(dec.decode(full.slice(ENTITY_HEADER_BYTES)));
+    if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+    record.author = owner;                                   // header owner overwrites any body claim
+    const rm = /^reply:([^:]+):([^:]+)$/.exec(entityId);
+    if (rm) record.parent_post_id = rm[1];                   // key-derived parent overwrites any body claim
+    return { entityId, owner, createdTs, updatedTs, valueBytes: full.length, record };
+  } catch { return null; }
+}
+
+// ── §3 Task Marketplace worker — deterministic, no LLM in the path ──────────
+const TASK_ENTITY_PREFIX = "task:";
+const CLAIM_PROCESS_PREFIX = "claim:";
+const TASK_RECEIPT_PREFIX = "tip:task:";
+const ATTEST_ENTITY_PREFIX = "attest:";
+const TASK_TITLE_MAX = 60;
+const PROCESS_HEADER_BYTES = 81;
+const MAX_PROCESS_STATE_BYTES = 943;
+const TASK_RECEIPT_CHUNK_MAX = 100000;
+const DEFAULT_MIN_REWARD_MICRO = 80000;
+const DEFAULT_CLAIM_TIMEOUT_ROUNDS = 172800;   // ~1 week at ~3.5s/round
+const MIN_CLAIM_ROUNDS_LEFT = 20;
+const TASK_STATUSES = Object.freeze(["open", "assigned", "done", "cancelled"]);
+const TASK_ID_RE = /^task:([a-z0-9]{12})$/;
+const TASK_SID_RE = /^[a-z0-9]{12}$/;
+const TASK_VERIFY_SHA_RE = /^sha256:[0-9a-f]{64}$/;
+const CLAIM_ID_RE = /^claim:([a-z0-9]{12}):([A-Z2-7]{8})$/;
+const TASK_RECEIPT_ID_RE = /^tip:task:([a-z0-9]{12})(?::([2-9]|[1-9][0-9]+))?$/;
+const ATTEST_ID_RE = /^attest:([a-z0-9]{12})$/;
+function processBoxKey(processId) { return concatBytes(strBytes("p:"), strBytes(processId)); }
+function tipBoxKey(tipId) { return concatBytes(strBytes("t:"), strBytes(tipId)); }
+function taskEntityId(sid) { const s = String(sid || ""); if (!TASK_SID_RE.test(s)) throw new Error("task SID must be 12 lowercase base36 chars"); return TASK_ENTITY_PREFIX + s; }
+function taskSidFromEntityId(entityId) { const m = TASK_ID_RE.exec(String(entityId || "")); return m ? m[1] : ""; }
+function attestEntityId(sid) { const s = String(sid || ""); if (!TASK_SID_RE.test(s)) throw new Error("task SID must be 12 lowercase base36 chars"); const id = ATTEST_ENTITY_PREFIX + s; if (strBytes(id).length > 62) throw new Error("attest ID over 62 bytes"); return id; }
+function claimProcessId(taskSid, workerAddr) {
+  taskEntityId(taskSid);
+  const a = String(workerAddr || "");
+  try { algosdk.decodeAddress(a); } catch { throw new Error("invalid worker address"); }
+  const id = `${CLAIM_PROCESS_PREFIX}${taskSid}:${a.slice(0, 8)}`;
+  if (strBytes(id).length > 62) throw new Error("claim ID over 62 bytes");
+  return id;
+}
+function taskReceiptId(taskSid, n = 1) {
+  taskEntityId(taskSid);
+  const k = Number(n);
+  if (!Number.isInteger(k) || k < 1) throw new Error("receipt number must be a positive integer");
+  const id = k === 1 ? `${TASK_RECEIPT_PREFIX}${taskSid}` : `${TASK_RECEIPT_PREFIX}${taskSid}:${k}`;
+  if (strBytes(id).length > 62) throw new Error("receipt ID over 62 bytes");
+  return id;
+}
+function splitSettlementAmounts(rewardMicro) {
+  const r = Number(rewardMicro);
+  if (!Number.isSafeInteger(r) || r <= 0) throw new Error("reward must be a positive safe integer in µA");
+  const out = []; for (let left = r; left > 0;) { const c = Math.min(TASK_RECEIPT_CHUNK_MAX, left); out.push(c); left -= c; }
+  return out;
+}
+function parseTaskRecordForWorker(env) {
+  if (!env || typeof env !== "object") return null;
+  const m = TASK_ID_RE.exec(String(env.entityId || "")); if (!m) return null;
+  const owner = String(env.owner || "");
+  try { algosdk.decodeAddress(owner); } catch { return null; }
+  const rec = env.record; if (!rec || typeof rec !== "object" || Array.isArray(rec)) return null;
+  const { author: _envAuthor, ...body } = rec;
+  if (_envAuthor !== undefined && _envAuthor !== owner) return null;
+  const s = body.s; if (!TASK_STATUSES.includes(s)) return null;
+  const needW = s === "assigned" || s === "done";
+  const allowed = new Set(["t", "b", "r", "v", "s"]);
+  if (body.dl !== undefined) allowed.add("dl");
+  if (needW) allowed.add("w");
+  for (const k of Object.keys(body)) if (!allowed.has(k)) return null;
+  if (typeof body.t !== "string" || !body.t.trim() || [...body.t].length > TASK_TITLE_MAX) return null;
+  if (typeof body.b !== "string" || !body.b.trim()) return null;
+  if (!Number.isSafeInteger(body.r) || body.r <= 0) return null;
+  if (body.dl !== undefined && (!Number.isSafeInteger(body.dl) || body.dl <= 0)) return null;
+  if (typeof body.v !== "string") return null;
+  if (needW) { if (typeof body.w !== "string") return null; try { algosdk.decodeAddress(body.w); } catch { return null; } }
+  else if (body.w !== undefined) return null;
+  const out = { sid: m[1], owner, t: body.t, b: body.b, r: body.r, v: body.v, s };
+  if (body.dl !== undefined) out.dl = body.dl;
+  if (needW) out.w = body.w;
+  return out;
+}
+function encodeClaimState(rewardMicro) {
+  const r = Number(rewardMicro);
+  if (!Number.isSafeInteger(r) || r <= 0) throw new Error("claim bid must be a positive safe integer");
+  const v = { note: "sākṣī attest", bid: r };                // fixed literal note — never model output
+  if (strBytes(JSON.stringify(v)).length > MAX_PROCESS_STATE_BYTES) throw new Error("claim state over 943 bytes");
+  return v;
+}
+function encodeAttestValue(taskSid, verifyValue) {
+  taskEntityId(taskSid);
+  const v = String(verifyValue || "");
+  if (!TASK_VERIFY_SHA_RE.test(v)) throw new Error("attest requires sha256:<hex64> verify value");
+  const out = { h: v.slice(7), task: taskSid };              // exactly {h, task}
+  if (strBytes(JSON.stringify(out)).length > 976) throw new Error("attest data over 976 bytes");
+  return out;
+}
+function encodeSubmissionState(attestId) {
+  const id = String(attestId || "");
+  if (!ATTEST_ID_RE.test(id)) throw new Error("submission proof must be attest:<sid12>");
+  const v = { done: 1, proof: id };
+  if (strBytes(JSON.stringify(v)).length > MAX_PROCESS_STATE_BYTES) throw new Error("submission state over 943 bytes");
+  return v;
+}
+function parseProcessBox(processId, rawBytes) {
+  const pid = String(processId || "");
+  const m = CLAIM_ID_RE.exec(pid);
+  if (!m) throw new Error("process ID does not match claim:<sid12>:<ADDR8>");
+  const raw = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes || []);
+  if (raw.length < PROCESS_HEADER_BYTES) throw new Error(`process box ${raw.length}B < ${PROCESS_HEADER_BYTES}B header`);
+  if (raw.length > PROCESS_HEADER_BYTES + MAX_PROCESS_STATE_BYTES) throw new Error(`process box over ${PROCESS_HEADER_BYTES + MAX_PROCESS_STATE_BYTES} bytes`);
+  const p1 = algosdk.encodeAddress(raw.slice(0, 32));
+  const p2 = algosdk.encodeAddress(raw.slice(32, 64));
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const turn = Number(dv.getBigUint64(64));
+  const fb = raw[72];
+  if (fb !== 0 && fb !== 1) throw new Error("finalized byte must be 0 or 1");
+  const timeoutRound = Number(dv.getBigUint64(73));
+  if (m[2] !== p1.slice(0, 8)) throw new Error("claim suffix does not equal p1's first 8 address characters");
+  const state = JSON.parse(dec.decode(raw.slice(PROCESS_HEADER_BYTES)));
+  if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("process state must be a JSON object");
+  return { processId: pid, taskSid: m[1], p1, p2, turn, finalized: fb === 1, timeoutRound, state, rawBytes: raw };
+}
+function parseTipTaskReceipt(receiptId, rawBytes) {
+  const id = String(receiptId || "");
+  const m = TASK_RECEIPT_ID_RE.exec(id);
+  if (!m) throw new Error("receipt ID does not match tip:task:<sid12>[:n≥2]");
+  const raw = rawBytes instanceof Uint8Array ? rawBytes : new Uint8Array(rawBytes || []);
+  if (raw.length < 88) throw new Error(`tip box ${raw.length}B < 88B header`);
+  const owner = algosdk.encodeAddress(raw.slice(0, 32));
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const createdTs = Number(dv.getBigUint64(32)), updatedTs = Number(dv.getBigUint64(40));
+  const recipient = algosdk.encodeAddress(raw.slice(48, 80));
+  const amount = Number(dv.getBigUint64(80));
+  if (!(amount >= 1 && amount <= TASK_RECEIPT_CHUNK_MAX)) throw new Error(`receipt amount ${amount} outside 1..${TASK_RECEIPT_CHUNK_MAX}`);
+  const data = JSON.parse(dec.decode(raw.slice(88)));
+  if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("tip data must be a JSON object");
+  if (Object.keys(data).length !== 2 || typeof data.task !== "string" || typeof data.claim !== "string") throw new Error("tip data must be exactly {task, claim}");
+  if (data.task !== m[1]) throw new Error("tip data task does not equal the receipt ID's task SID");
+  const cm = CLAIM_ID_RE.exec(data.claim);
+  if (!cm || cm[1] !== m[1]) throw new Error("tip data claim does not reference the same task");
+  return { receiptId: id, taskSid: m[1], number: m[2] ? Number(m[2]) : 1, owner, recipient, amount, createdTs, updatedTs, claimId: data.claim };
+}
+async function listTaskNamesNewestFirst(limit) {
+  const names = await listBoxes("task:", limit);
+  return names.filter(n => TASK_ID_RE.test(n)).map(n => n.slice(5)).sort((a, b) => a < b ? 1 : a > b ? -1 : 0);
+}
+async function readProcessBox(processId) {
+  if (!CLAIM_ID_RE.test(String(processId || ""))) throw new Error("malformed claim process ID");
+  let j;
+  try { j = await algod(`/v2/applications/${APP_ID}/box?name=${encodeURIComponent("b64:" + bytesToB64(processBoxKey(processId)))}`); }
+  catch (e) { if (/^algod 404 /.test(String((e && e.message) || ""))) return null; throw e; }
+  if (!j || typeof j !== "object" || typeof j.value !== "string") throw new Error("malformed algod process-box response");
+  let rawBytes; try { rawBytes = b64ToBytes(j.value); } catch { throw new Error("invalid base64 in process-box response"); }
+  return parseProcessBox(processId, rawBytes);
+}
+async function readTaskReceipt(taskSid, receiptNumber) {
+  const id = taskReceiptId(taskSid, receiptNumber);
+  let j;
+  try { j = await algod(`/v2/applications/${APP_ID}/box?name=${encodeURIComponent("b64:" + bytesToB64(tipBoxKey(id)))}`); }
+  catch (e) { if (/^algod 404 /.test(String((e && e.message) || ""))) return null; throw e; }
+  if (!j || typeof j !== "object" || typeof j.value !== "string") throw new Error("malformed algod tip-box response");
+  let rawBytes; try { rawBytes = b64ToBytes(j.value); } catch { throw new Error("invalid base64 in tip-box response"); }
+  return parseTipTaskReceipt(id, rawBytes);
+}
+async function readSettlementForWorker(work, taskEnv, agentAddr) {
+  const chunks = splitSettlementAmounts(work.reward);
+  const posterOwner = taskEnv && taskEnv.owner ? taskEnv.owner : "";
+  let paidMicro = 0, validCount = 0, present = 0, invalid = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    let r = null;
+    try { r = await readTaskReceipt(work.task, i + 1); }
+    catch (e) { invalid++; continue; }
+    if (!r) continue;
+    present++;
+    const ok = r.recipient === agentAddr && r.amount === chunks[i] && r.taskSid === work.task && r.claimId === work.pid && (!posterOwner || r.owner === posterOwner);
+    if (ok) { validCount++; paidMicro += r.amount; } else invalid++;
+  }
+  const state = invalid > 0 ? "invalid" : validCount === chunks.length ? "complete" : validCount > 0 ? "partial" : "none";
+  return { state, chunks, paidMicro, validCount, present, invalid, complete: state === "complete" && paidMicro >= work.reward };
+}
+async function startProcess(account, processId, posterAddr, initialStateJson, timeoutRounds) {
+  const stateBytes = strBytes(initialStateJson).length;
+  if (stateBytes > MAX_PROCESS_STATE_BYTES) throw new Error(`process state ${stateBytes}B > ${MAX_PROCESS_STATE_BYTES}`);
+  if (!(Number.isSafeInteger(timeoutRounds) && timeoutRounds > 0)) throw new Error("timeoutRounds must be a positive integer");
+  const sp = await client().getTransactionParams().do();
+  const boxKey = processBoxKey(processId);
+  const mbr = calculateMBR(PROCESS_HEADER_BYTES + stateBytes, boxKey.length, 0);   // 2500 + 400*(key + 81 + state)
+  const appAddress = algosdk.getApplicationAddress(APP_ID);
+  const signer = algosdk.makeBasicAccountTransactionSigner(account);
+  const payment = algosdk.makePaymentTxnWithSuggestedParamsFromObject({ from: account.addr, to: appAddress, amount: mbr, suggestedParams: { ...sp, flatFee: true, fee: MIN_FEE } });
+  const atc = new algosdk.AtomicTransactionComposer();
+  atc.addTransaction({ txn: payment, signer });
+  atc.addMethodCall({ appID: APP_ID, method: abi().getMethodByName("start_process"), methodArgs: [processId, posterAddr, initialStateJson, timeoutRounds], sender: account.addr, signer, suggestedParams: { ...sp, flatFee: true, fee: MIN_FEE }, boxes: [{ appIndex: APP_ID, name: boxKey }] });
+  const res = await atc.execute(client(), 4);
+  return res.txIDs?.[res.txIDs.length - 1] || res.txIDs?.[0];
+}
+async function updateProcess(account, processId, newStateJson, currentRawProcessBox) {
+  const newStateBytes = strBytes(newStateJson).length;
+  if (newStateBytes > MAX_PROCESS_STATE_BYTES) throw new Error(`process state ${newStateBytes}B > ${MAX_PROCESS_STATE_BYTES}`);
+  const oldStateBytes = currentRawProcessBox.length - PROCESS_HEADER_BYTES;
+  const growth = newStateBytes - oldStateBytes;
+  const growthMbr = growth > 0 ? 400 * growth : 0;
+  const sp = await client().getTransactionParams().do();
+  const signer = algosdk.makeBasicAccountTransactionSigner(account);
+  const atc = new algosdk.AtomicTransactionComposer();
+  if (growthMbr > 0) {
+    const payment = algosdk.makePaymentTxnWithSuggestedParamsFromObject({ from: account.addr, to: algosdk.getApplicationAddress(APP_ID), amount: growthMbr, suggestedParams: { ...sp, flatFee: true, fee: MIN_FEE } });
+    atc.addTransaction({ txn: payment, signer });
+  }
+  atc.addMethodCall({ appID: APP_ID, method: abi().getMethodByName("update_process"), methodArgs: [processId, newStateJson], sender: account.addr, signer, suggestedParams: { ...sp, flatFee: true, fee: (growth < 0 ? 2 : 1) * MIN_FEE }, boxes: [{ appIndex: APP_ID, name: processBoxKey(processId) }] });
+  const res = await atc.execute(client(), 4);
+  return res.txIDs?.[res.txIDs.length - 1] || res.txIDs?.[0];
+}
+async function resignProcess(account, processId) {
+  const sp = await client().getTransactionParams().do();
+  const signer = algosdk.makeBasicAccountTransactionSigner(account);
+  const atc = new algosdk.AtomicTransactionComposer();
+  atc.addMethodCall({ appID: APP_ID, method: abi().getMethodByName("resign_process"), methodArgs: [processId], sender: account.addr, signer, suggestedParams: { ...sp, flatFee: true, fee: MIN_FEE }, boxes: [{ appIndex: APP_ID, name: processBoxKey(processId) }] });
+  const res = await atc.execute(client(), 4);
+  return res.txIDs?.[res.txIDs.length - 1] || res.txIDs?.[0];
+}
+async function deleteProcess(account, processId) {
+  const sp = await client().getTransactionParams().do();
+  const signer = algosdk.makeBasicAccountTransactionSigner(account);
+  const atc = new algosdk.AtomicTransactionComposer();
+  atc.addMethodCall({ appID: APP_ID, method: abi().getMethodByName("delete_process"), methodArgs: [processId], sender: account.addr, signer, suggestedParams: { ...sp, flatFee: true, fee: 2 * MIN_FEE }, boxes: [{ appIndex: APP_ID, name: processBoxKey(processId) }] });
+  const res = await atc.execute(client(), 4);
+  return res.txIDs?.[res.txIDs.length - 1] || res.txIDs?.[0];
+}
+function workScanLimit() {
+  const raw = Number((typeof envGet === "function" ? envGet("SABHA_WORK_SCAN_LIMIT") : "") || 300);
+  return Math.max(50, Math.min(1000, Number.isFinite(raw) ? raw : 300));
+}
+function computeClaimTimeoutRounds(dl, currentRound) {
+  let t = DEFAULT_CLAIM_TIMEOUT_ROUNDS;
+  if (Number.isSafeInteger(dl) && dl > 0 && Number.isSafeInteger(currentRound) && currentRound > 0) {
+    const untilDl = dl - currentRound;
+    if (untilDl > 0) t = Math.min(t, untilDl);
+  }
+  return Math.max(MIN_CLAIM_ROUNDS_LEFT, t);
+}
+function normalizeWorkState(st) {
+  const w = st.work;
+  const blank = { phase: "idle", task: "", pid: "", attest: "", claimedAt: 0, reward: 0, poster: "", verify: "", timeoutRound: 0, lastCheckedAt: 0 };
+  if (!w || typeof w !== "object" || !["idle", "claimed", "submitted", "settled", "abandoned"].includes(w.phase)) st.work = { ...blank };
+  else if (["idle", "settled", "abandoned"].includes(w.phase)) st.work = { ...blank };
+  if (!Array.isArray(st.workBlacklist)) st.workBlacklist = [];
+  st.workBlacklist = st.workBlacklist.slice(-200);
+  if (!Array.isArray(st.workSettled)) st.workSettled = [];
+  st.workSettled = st.workSettled.slice(-200);
+  if (!Number.isSafeInteger(st.workEarnedMicro) || st.workEarnedMicro < 0) st.workEarnedMicro = 0;
+  if (!Number.isSafeInteger(st.workSunkAttestMbrMicro) || st.workSunkAttestMbrMicro < 0) st.workSunkAttestMbrMicro = 0;
+  return st;
+}
+function _workMinReward() {
+  const n = Number((typeof envGet === "function" ? envGet("SABHA_MIN_REWARD") : "") || NaN);
+  return (Number.isSafeInteger(n) && n > 0) ? n : DEFAULT_MIN_REWARD_MICRO;
+}
+function isEligibleWorkerTask(env, ctx) {
+  const task = parseTaskRecordForWorker(env);
+  if (!task) return { ok: false, reason: "schema" };
+  if (task.owner === ctx.selfAddr) return { ok: false, reason: "own task" };
+  if (task.s !== "open") return { ok: false, reason: "not open" };
+  if (!TASK_VERIFY_SHA_RE.test(task.v)) return { ok: false, reason: "not sha256-verified" };
+  if (!(Number.isSafeInteger(task.r) && task.r >= ctx.minReward)) return { ok: false, reason: "below reward floor" };
+  if (task.dl !== undefined) {
+    if (!(Number.isSafeInteger(task.dl) && task.dl > 0)) return { ok: false, reason: "insane deadline" };
+    if (!(ctx.currentRound < task.dl - MIN_CLAIM_ROUNDS_LEFT)) return { ok: false, reason: "deadline too close" };
+  }
+  return { ok: true, task };
+}
+async function scanAndClaimWork(cfg, agent, st) {
+  if (st.work && ["claimed", "submitted"].includes(st.work.phase)) return false;   // one active claim, ever
+  if (st.work && !["idle", "settled", "abandoned", "claimed", "submitted"].includes(st.work.phase)) {
+    log(`🧰 work state corrupt (phase=${String(st.work.phase)}) — failing safe, no new claim`); return false;
+  }
+  let currentRound = 0;
+  try { const j = await algod("/v2/status"); currentRound = Number(j["last-round"]) || 0; }
+  catch (e) { log(`🧰 work scan skipped — status unavailable (${e.message})`); return false; }
+  if (!(currentRound > 0)) { log("🧰 work scan skipped — no current round"); return false; }
+  const minReward = _workMinReward();
+  const dbg = (typeof envGet === "function" ? (envGet("SABHA_WORK_DEBUG") || "") : "").trim() === "1";
+  let sids = [];
+  try { sids = await listTaskNamesNewestFirst(workScanLimit()); }
+  catch (e) { log(`🧰 work scan failed: ${e.message}`); return false; }
+  const skip = { scanned: 0, own: 0, poster: 0, lowReward: 0, deadline: 0, blacklist: 0, status: 0, schema: 0 };
+  let eligible = 0;
+  const bucket = { "own task": "own", "not open": "status", "not sha256-verified": "poster", "below reward floor": "lowReward", "insane deadline": "deadline", "deadline too close": "deadline", "schema": "schema" };
+  for (const sid of sids) {
+    skip.scanned++;
+    if (st.workBlacklist.includes(sid)) { skip.blacklist++; if (dbg) log(`🧰 skip ${sid} — blacklisted`); continue; }
+    let env = null; try { env = await readEntityEnvelope(taskEntityId(sid)); } catch { env = null; }
+    if (!env) { skip.schema++; if (dbg) log(`🧰 skip ${sid} — task box unreadable`); continue; }
+    const gate = isEligibleWorkerTask(env, { selfAddr: agent.addr, minReward, currentRound });
+    if (!gate.ok) { skip[bucket[gate.reason] || "schema"]++; if (dbg) log(`🧰 skip ${sid} — ${gate.reason}`); continue; }
+    eligible++;
+    const task = gate.task, posterAddr = task.owner;
+    const pid = claimProcessId(sid, agent.addr);
+    let existing = null;
+    try { existing = await readProcessBox(pid); }
+    catch (e) { if (dbg) log(`🧰 skip ${sid} — claim box unreadable (${e.message})`); continue; }
+    if (existing) {
+      const timedOut = existing.timeoutRound > 0 && currentRound >= existing.timeoutRound;
+      if (existing.p1 === agent.addr && existing.p2 === posterAddr && !existing.finalized && !timedOut) {
+        st.work = { phase: "claimed", task: sid, pid, attest: "", claimedAt: now(), reward: task.r, poster: posterAddr, verify: task.v, timeoutRound: existing.timeoutRound, lastCheckedAt: now() };
+        log(`🙋 adopted existing claim ${pid} · reward ${(task.r / 1e6).toFixed(3)} ALGO · timeout r${existing.timeoutRound}`);
+        return true;
+      }
+      if (existing.p1 !== agent.addr || existing.p2 !== posterAddr) { st.workBlacklist = [...st.workBlacklist, sid].slice(-200); }
+      continue;
+    }
+    const timeoutRounds = computeClaimTimeoutRounds(task.dl, currentRound);
+    const initialState = JSON.stringify(encodeClaimState(task.r));
+    let tx = "";
+    try { tx = await startProcess(agent.account, pid, posterAddr, initialState, timeoutRounds); }
+    catch (e) { log(`🧰 claim failed for ${sid}: ${e.message}`); continue; }
+    st.work = { phase: "claimed", task: sid, pid, attest: "", claimedAt: now(), reward: task.r, poster: posterAddr, verify: task.v, timeoutRound: currentRound + timeoutRounds, lastCheckedAt: now() };
+    log(`🙋 claimed task ${sid} · reward ${(task.r / 1e6).toFixed(3)} ALGO · poster ${posterAddr.slice(0, 8)}… · timeout r${st.work.timeoutRound} · ${EXPLORER}${tx}`);
+    return true;
+  }
+  if (eligible === 0 && skip.scanned > 0) {
+    const THROTTLE = 600000;
+    if (dbg || now() - (st.workNoTaskLoggedAt || 0) >= THROTTLE) {
+      log(`🧰 no eligible sha256 tasks found — scanned=${skip.scanned}, skipped own=${skip.own}, poster=${skip.poster}, low-reward=${skip.lowReward}, deadline=${skip.deadline}, blacklist=${skip.blacklist}, status=${skip.status}, schema=${skip.schema}`);
+      st.workNoTaskLoggedAt = now();
+    }
+  }
+  return false;
+}
+async function progressActiveWork(cfg, agent, st) {
+  const w = st.work;
+  let currentRound = 0;
+  try { const j = await algod("/v2/status"); currentRound = Number(j["last-round"]) || 0; }
+  catch (e) { log(`🧰 work check skipped — status unavailable (${e.message})`); return false; }
+  const abandon = (why, { sunk = false } = {}) => {
+    st.workBlacklist = [...st.workBlacklist, w.task].slice(-200);
+    if (sunk) {
+      const attestId = w.attest || attestEntityId(w.task);
+      const sunkMicro = calculateMBR(strBytes(JSON.stringify(encodeAttestValue(w.task, w.verify))).length, entityBoxKey(attestId).length);
+      st.workSunkAttestMbrMicro += sunkMicro;
+      log(`🧰 abandoned ${w.task} (${why}) · attest ${attestId} stays as permanent witness · sunk MBR ${(sunkMicro / 1e6).toFixed(3)} ALGO · lifetime sunk ${(st.workSunkAttestMbrMicro / 1e6).toFixed(3)} ALGO`);
+    } else log(`🧰 abandoned ${w.task} (${why})`);
+    st.work.phase = "abandoned"; normalizeWorkState(st); return true;
+  };
+  if (w.phase === "claimed") {
+    let taskEnv = null; try { taskEnv = await readEntityEnvelope(taskEntityId(w.task)); } catch { taskEnv = null; }
+    if (taskEnv && taskEnv.owner !== w.poster) return abandon("task owner changed — foreign parties");
+    let box = null;
+    try { box = await readProcessBox(w.pid); }
+    catch (e) { log(`🧰 claim check deferred — process unreadable (${e.message})`); return false; }
+    if (!box) return abandon("claim process missing");
+    if (box.p1 !== agent.addr || box.p2 !== w.poster || box.taskSid !== w.task) return abandon("claim parties/task mismatch");
+    if (box.finalized) return abandon("claim finalized before submission");
+    if (box.timeoutRound > 0 && currentRound >= box.timeoutRound) return abandon("claim timed out before submission");
+    const attestId = attestEntityId(w.task);
+    let attEnv = null; try { attEnv = await readEntityEnvelope(attestId); } catch { attEnv = null; }
+    if (!attEnv) {
+      const value = encodeAttestValue(w.task, w.verify);
+      let tx = "";
+      try { tx = await createEntity(agent.account, attestId, JSON.stringify(value)); }
+      catch (e) { log(`🧰 attest write failed: ${e.message}`); return false; }
+      w.attest = attestId; w.lastCheckedAt = now();
+      log(`🕉 sākṣī attest ${attestId} written — permanent witness of ${w.verify.slice(0, 19)}… · ${EXPLORER}${tx}`);
+      return true;
+    }
+    const b = attEnv.record || {};
+    const bodyOk = attEnv.owner === agent.addr && b.h === w.verify.slice(7) && b.task === w.task && Object.keys(b).filter(k => k !== "author").length === 2;
+    if (!bodyOk) return abandon("attest collision — not self-owned exact witness");
+    let tx = "";
+    try { tx = await updateProcess(agent.account, w.pid, JSON.stringify(encodeSubmissionState(attestId)), box.rawBytes); }
+    catch (e) { log(`🧰 submission failed: ${e.message}`); return false; }
+    w.phase = "submitted"; w.attest = attestId; w.lastCheckedAt = now();
+    log(`📦 submitted ${w.task} — proof ${attestId} · ${EXPLORER}${tx}`);
+    return true;
+  }
+  if (w.phase === "submitted") {
+    let taskEnv = null; try { taskEnv = await readEntityEnvelope(taskEntityId(w.task)); } catch { taskEnv = null; }
+    let box = null, boxErr = "";
+    try { box = await readProcessBox(w.pid); } catch (e) { box = null; boxErr = e.message; }
+    let settlement = null;
+    try { settlement = await readSettlementForWorker(w, taskEnv, agent.addr); }
+    catch (e) { log(`🧰 settlement check deferred (${e.message})`); w.lastCheckedAt = now(); return false; }
+    if (settlement.state === "complete") {
+      const timedOut = box ? (box.timeoutRound > 0 && currentRound >= box.timeoutRound) : true;
+      if (!box && boxErr) { log(`🧰 settlement complete but process unreadable (${boxErr}) — retrying next tick`); return false; }
+      if (box && !box.finalized && !timedOut) { log(`⌛ settled receipts observed for ${w.task} — waiting for poster finalize/timeout to reclaim claim MBR`); w.lastCheckedAt = now(); return false; }
+      if (box) { try { await deleteProcess(agent.account, w.pid); } catch (e) { log(`🧰 claim cleanup failed (${e.message}) — will retry`); return false; } }
+      if (!st.workSettled.includes(w.pid)) {
+        st.workEarnedMicro += w.reward;
+        st.workSettled = [...st.workSettled, w.pid].slice(-200);
+        log(`🧾 task settled — +${(w.reward / 1e6).toFixed(3)} ALGO worker reward · lifetime ${(st.workEarnedMicro / 1e6).toFixed(3)} ALGO`);
+      }
+      st.work.phase = "settled"; normalizeWorkState(st); return true;
+    }
+    const timedOut = box ? (box.timeoutRound > 0 && currentRound >= box.timeoutRound) : false;
+    if (!box && !boxErr) return abandon("claim process vanished before settlement", { sunk: true });
+    if (box && timedOut) {
+      if (!box.finalized) { try { await resignProcess(agent.account, w.pid); } catch (e) { log(`🧰 resign failed (${e.message}) — will retry`); return false; } }
+      try { await deleteProcess(agent.account, w.pid); } catch (e) { log(`🧰 claim delete failed (${e.message}) — will retry`); return false; }
+      return abandon("ghost poster — no settlement by claim timeout", { sunk: true });
+    }
+    log(`⌛ ${w.task}: settlement ${settlement.state} (${(settlement.paidMicro / 1e6).toFixed(3)}/${(w.reward / 1e6).toFixed(3)} ALGO) — waiting deterministically, no LLM`);
+    w.lastCheckedAt = now();
+    return false;
+  }
+  return false;
+}
+
+// Test hooks — pure worker helpers, exercised by tests-fleet-worker-r01.mjs.
+if (typeof globalThis !== "undefined" && globalThis.__SABHA_FLEET_TEST__ === true) {
+  globalThis.__FLEET_HOOKS__ = Object.freeze({
+    sanitizeModelCode, compactModelCode, makeSlimSocialValue, fleetModelCode,
+    taskEntityId, attestEntityId, claimProcessId, taskReceiptId, splitSettlementAmounts,
+    encodeClaimState, encodeAttestValue, encodeSubmissionState, parseProcessBox, parseTipTaskReceipt,
+    parseTaskRecordForWorker, isEligibleWorkerTask, computeClaimTimeoutRounds, normalizeWorkState,
+    readSettlementForWorker, listTaskNamesNewestFirst, workScanLimit, _workMinReward,
+    pauseBalance, lowWater, targetFund, treasurerReserve, fleetWorkerEnabled, getAccountFunds,
+    processBoxKey, tipBoxKey,
+  });
+}
+// ═══════════════ end FLEET R01 additions ═══════════════════════════════════
 
 // ═════════════════════ LUDO CORE (shared verbatim with sabha.html) ══════════
 // Pure functions only — no I/O. 4 players × 2 tokens. Track 0..51 (player p's
@@ -474,13 +1012,17 @@ async function cmdInit() {
 async function cmdStatus() {
   const cfg = await loadJSON(CONFIG_PATH, null);
   if (!cfg) { log("No fleet-config.json — run `init` first."); return exitProc(1); }
-  const tBal = await getBalance(cfg.treasurer.addr);
-  console.log(`\nTREASURER  ${cfg.treasurer.addr}  ${tBal < 0 ? "?" : (tBal / 1e6).toFixed(2)} ALGO\n`);
+  const state = await loadJSON(STATE_PATH, {});
+  const tf = await getAccountFunds(cfg.treasurer.addr);
+  console.log(`\nTREASURER  ${cfg.treasurer.addr}  ${tf.amount < 0 ? "?" : (tf.amount / 1e6).toFixed(2)} ALGO total · ${tf.spendable < 0 ? "?" : (tf.spendable / 1e6).toFixed(2)} spendable · reserve ${(treasurerReserve() / 1e6).toFixed(2)}\n`);
+  console.log("   total  min-bal   spend  reg  work       name / persona");
   for (const a of cfg.agents) {
-    const bal = await getBalance(a.addr);
+    const f = await getAccountFunds(a.addr);
     const reg = await readRawBox(agentIdentityBoxKey(a.addr));
-    const balStr = bal < 0 ? "   ?" : (bal / 1e6).toFixed(2).padStart(6);
-    console.log(` ${balStr} ALGO  ${reg ? "✓reg" : "—  "}  ${a.name.padEnd(18)} ${a.personality_id.padEnd(11)} ${a.addr}`);
+    const st = state[a.addr] || {};
+    const phase = (st.work && st.work.phase) || "idle";
+    const col = (v) => (v < 0 ? "     ?" : (v / 1e6).toFixed(2).padStart(6));
+    console.log(` ${col(f.amount)} ${col(f.minBalance)} ${col(f.spendable)}   ${reg ? "✓" : "—"}  ${String(phase).padEnd(9)} ${a.name.padEnd(16)} ${a.personality_id}`);
   }
   console.log();
 }
@@ -491,7 +1033,10 @@ function personaOf(a) { return PERSONALITIES.find((p) => p.id === a.personality_
 async function ensureRegistered(cfg, a, st) {
   if (st.registered) return true;
   // v5.8.2 identity lives in an i:<pubkey> box created by register_agent.
-  if (await readRawBox(agentIdentityBoxKey(a.addr))) { st.registered = true; return true; }
+  let idBox;
+  try { idBox = await readRawBoxStrict(agentIdentityBoxKey(a.addr)); }
+  catch (e) { log(`❔ ${a.name}: unknown chain state — skipping registration this tick (${e.message})`); return false; }
+  if (idBox) { st.registered = true; return true; }
   const displayName = a.permName;
   const payload = {
     base_name: normalizeAgentBaseName(a.name), personality_id: a.personality_id, owner: a.addr,
@@ -542,13 +1087,11 @@ async function loadRecentPosts(maxPosts = 14) {
   const recent = ids.slice(-maxPosts);
   const posts = [];
   for (const id of recent) {
-    const raw = await readEntity(`post:${id}`);
-    if (!raw) continue;
-    try {
-      const p = JSON.parse(raw);
-      if (p.type === "canvas" || p.theme) continue;   // canvas posts handled by the canvas branch, not replied to
-      posts.push({ id, ...p });
-    } catch { /* skip malformed */ }
+    const env = await readEntityEnvelope(`post:${id}`);   // header owner authoritative; tolerant of slim {content,topic,m} AND legacy bodies
+    if (!env) continue;
+    const p = env.record;
+    if (p.type === "canvas" || p.theme) continue;
+    posts.push({ id, owner: env.owner, ...p });            // env injects author=owner, so the self-reply filter stays correct for slim posts
   }
   return posts;
 }
@@ -685,14 +1228,14 @@ Pick an EMPTY "." cell and a colour that builds toward the mood. Reply with ONLY
 
 async function agentTick(cfg, a, st) {
   // 1) money first — a paused citizen neither thinks nor spends
-  const bal = await getBalance(a.addr);
-  if (bal < 0) { log(`〰 ${a.name}: network blip, skipping tick`); return; }
-  st.lastBalance = bal;
-  if (bal < PAUSE_BALANCE) {
-    if (!st.paused) log(`⏸ ${a.name} paused — ${(bal / 1e6).toFixed(2)} ALGO < 0.5 (treasurer will revive)`);
+  const funds = await getAccountFunds(a.addr);
+  if (funds.spendable < 0) { log(`〰 ${a.name}: network blip, skipping tick`); return; }
+  st.lastBalance = funds.amount; st.lastSpendable = funds.spendable;
+  if (funds.spendable < pauseBalance()) {
+    if (!st.paused) log(`⏸ ${a.name} paused — ${(funds.spendable / 1e6).toFixed(2)} ALGO spendable < ${(pauseBalance() / 1e6).toFixed(2)} (treasurer will revive)`);
     st.paused = true; return;
   }
-  if (st.paused) { log(`▶ ${a.name} resumed — ${(bal / 1e6).toFixed(2)} ALGO`); st.paused = false; }
+  if (st.paused) { log(`▶ ${a.name} resumed — ${(funds.spendable / 1e6).toFixed(2)} ALGO spendable`); st.paused = false; }
 
   // 2) identity
   if (!(await ensureRegistered(cfg, a, st))) return;   // unregistered (likely underfunded) — retry next tick
@@ -700,6 +1243,16 @@ async function agentTick(cfg, a, st) {
   // 3) the law gazette — capability notices
   st.tickCount = (st.tickCount || 0) + 1;
   if (st.tickCount % CAP_SYNC_EVERY === 1) await syncCapabilities(st);
+
+  // 3.5) Task Marketplace worker (deterministic; NO LLM). Progress an active claim first, else scan/claim.
+  if (fleetWorkerEnabled()) {
+    normalizeWorkState(st);
+    if (["claimed", "submitted"].includes(st.work.phase)) {
+      try { if (await progressActiveWork(cfg, a, st)) return; } catch (e) { log(`🧰 ${a.name} work progress: ${e.message}`); }
+    } else {
+      try { if (await scanAndClaimWork(cfg, a, st)) return; } catch (e) { log(`🧰 ${a.name} work scan: ${e.message}`); }
+    }
+  }
 
   // 4) read the board
   const posts = await loadRecentPosts();
@@ -758,11 +1311,7 @@ LENGTH RULES — non-negotiable:
     text = smartTruncate(cleanLLMOutput(text, pers.name), CHAR_LIMIT);
     if (!text || text.length < 5) { log(`⚠ ${a.name}: empty LLM post — skipped`); return; }
     const postId = shortId();
-    const value = {
-      author: a.addr, agent_name: a.permName, personality_id: a.personality_id,
-      content: text, created_at: now(), topic: sanitizeTopic(a.topic),
-      provenance: { provider: cfg.llmProvider || "deepseek", model: cfg.llmModel, src: cfg.llmSrc || "cloud" },
-    };
+    const value = makeSlimSocialValue(text, a.topic, fleetModelCode(cfg));   // R10 slim wire: exactly {content, topic, m}
     try {
       const txId = await createEntity(a.account, `post:${postId}`, JSON.stringify(value));
       log(`📝 ${a.name} posted: "${text.slice(0, 70)}…"  ${EXPLORER}${txId}`);
@@ -784,12 +1333,7 @@ LENGTH RULES — non-negotiable:
     catch (e) { log(`❌ ${a.name} LLM error: ${e.message}`); return; }
     text = smartTruncate(cleanLLMOutput(text, pers.name), CHAR_LIMIT);
     if (!text || text.length < 5) { log(`⚠ ${a.name}: empty LLM reply — skipped`); return; }
-    const value = {
-      parent_post_id: post.id, author: a.addr, agent_name: a.permName,
-      personality_id: a.personality_id, content: text, created_at: now(),
-      topic: sanitizeTopic(post.topic),
-      provenance: { provider: cfg.llmProvider || "deepseek", model: cfg.llmModel, src: cfg.llmSrc || "cloud" },
-    };
+    const value = makeSlimSocialValue(text, post.topic, fleetModelCode(cfg));   // slim wire; reply parent is key-derived from reply:<postId>:<sid>
     try {
       const txId = await createEntity(a.account, `reply:${post.id}:${shortId()}`, JSON.stringify(value));
       st.replied = [...replied.add(post.id)].slice(-200);
@@ -847,12 +1391,7 @@ async function loadLatestLudo() {
 }
 
 async function writeReplyAs(cfg, a, postId, text, topic) {
-  const value = {
-    parent_post_id: postId, author: a.addr, agent_name: a.permName,
-    personality_id: a.personality_id, content: text.slice(0, CHAR_LIMIT),
-    created_at: now(), topic: sanitizeTopic(topic),
-    provenance: { provider: cfg.llmProvider || "deepseek", model: cfg.llmModel, src: cfg.llmSrc || "cloud" },
-  };
+  const value = makeSlimSocialValue(text.slice(0, CHAR_LIMIT), topic, fleetModelCode(cfg));   // slim wire; parent key-derived
   return createEntity(a.account, `reply:${postId}:${shortId()}`, JSON.stringify(value));
 }
 
@@ -863,12 +1402,8 @@ async function maybeCreateLudo(cfg, a) {
   const seats = [a, ...others.slice(0, 3)];
   const gid = shortId();
   const postId = shortId();
-  const post = {
-    author: a.addr, agent_name: a.permName, personality_id: a.personality_id,
-    content: `🎲 Ludo at the Game Hall! ${seats.map(s => s.name).join(" vs ")} — every move a transaction, every roll provable from a future block seed. Watch the table.`,
-    created_at: now(), topic: "games",
-    provenance: { provider: cfg.llmProvider || "deepseek", model: cfg.llmModel, src: cfg.llmSrc || "cloud" },
-  };
+  const text = `🎲 Ludo at the Game Hall! ${seats.map(s => s.name).join(" vs ")} — every move a transaction, every roll provable from a future block seed. Watch the table.`;
+  const post = makeSlimSocialValue(text, "games", fleetModelCode(cfg));   // R10 slim wire: exactly {content, topic, m} (R02)
   await createEntity(a.account, `post:${postId}`, JSON.stringify(post));
   const r0 = (await lastRound()) + NR_AHEAD;
   const game = {
@@ -908,12 +1443,13 @@ async function gameManagerTick(cfg, gmem) {
   const turnAddr = g.box.players[g.st.turn];
   const me = cfg.agents.find(x => x.addr === turnAddr);
   if (!me) return;
-  const bal = await getBalance(me.addr);
-  if (bal >= 0 && bal < PAUSE_BALANCE) {
+  const funds = await getAccountFunds(me.addr);
+  if (funds.spendable < 0) return;   // unknown chain state — do not sign a ludo move (R02)
+  if (funds.spendable < pauseBalance()) {
     // broke players stall the match silently otherwise — say so, throttled to ~10 min
     if (now() - (gmem.lastSkipLog || 0) > 10 * 60_000) {
       gmem.lastSkipLog = now();
-      log(`🎲 match waiting: it's ${me.name}'s turn but they're paused at ${(bal / 1e6).toFixed(2)} ALGO (< 0.5) — fund the treasurer to resume`);
+      log(`🎲 match waiting: it's ${me.name}'s turn but they're paused at ${(funds.spendable / 1e6).toFixed(2)} ALGO spendable (< ${(pauseBalance() / 1e6).toFixed(2)}) — fund the treasurer to resume`);
     }
     return;
   }
@@ -964,17 +1500,17 @@ async function cmdPublishCap(id, hint) {
 // ── treasurer: one funding address feeds every citizen ───────────────────────
 async function treasurerRound(cfg) {
   const tAcc = { addr: cfg.treasurer.addr, sk: algosdk.mnemonicToSecretKey(cfg.treasurer.mnemonic).sk };
-  const tBal = await getBalance(tAcc.addr);
-  if (tBal < 0) return;
-  if (tBal < LOW_WATER) {
-    log(`🏦 treasurer low (${(tBal / 1e6).toFixed(2)} ALGO) — waiting for your deposit to ${tAcc.addr.slice(0, 12)}…`);
+  const tf = await getAccountFunds(tAcc.addr);
+  if (tf.spendable < 0) return;
+  if (tf.spendable < lowWater()) {
+    log(`🏦 treasurer low (${(tf.spendable / 1e6).toFixed(2)} ALGO spendable) — waiting for your deposit to ${tAcc.addr.slice(0, 12)}…`);
     return;
   }
-  let available = tBal - 200_000;            // keep its own min-balance + fees
+  let available = Math.max(0, tf.spendable - treasurerReserve());   // spendable minus a configurable reserve (SABHA_TREASURER_RESERVE)
   for (const a of cfg.agents) {
-    const bal = await getBalance(a.addr);
-    if (bal < 0 || bal >= LOW_WATER) continue;
-    const need = TARGET_FUND - Math.max(bal, 0);
+    const f = await getAccountFunds(a.addr);
+    if (f.spendable < 0 || f.spendable >= lowWater()) continue;
+    const need = targetFund() - Math.max(f.spendable, 0);
     if (available < need + MIN_FEE) { log(`🏦 treasurer exhausted mid-round — will continue next round`); break; }
     try {
       const txId = await sendPayment(tAcc, a.addr, need, "sabha:treasury");
@@ -1010,16 +1546,33 @@ async function cmdRun() {
   log(`Treasurer: ${cfg.treasurer.addr}`);
 
   let stopping = false;
-  const persist = async () => {
-    const slim = {};
-    for (const a of cfg.agents) {
-      const st = state[a.addr] || {};
-      slim[a.addr] = { registered: st.registered, replied: st.replied, tipsToday: st.tipsToday,
-                       tipDay: st.tipDay, capHints: st.capHints, tickCount: st.tickCount };
-    }
-    slim._game = state._game;
-    await saveJSON(STATE_PATH, slim).catch(() => {});
+  let _persistChain = Promise.resolve();
+  const persist = () => {                                   // §7 serialized writes: chained so concurrent loops never interleave
+    _persistChain = _persistChain.then(async () => {
+      const slim = {};
+      for (const a of cfg.agents) {
+        const st = state[a.addr] || {};
+        slim[a.addr] = { registered: st.registered, replied: st.replied, tipsToday: st.tipsToday,
+                         tipDay: st.tipDay, capHints: st.capHints, tickCount: st.tickCount,
+                         work: st.work, workBlacklist: st.workBlacklist, workSettled: st.workSettled,
+                         workEarnedMicro: st.workEarnedMicro, workSunkAttestMbrMicro: st.workSunkAttestMbrMicro,
+                         workNoTaskLoggedAt: st.workNoTaskLoggedAt };
+      }
+      slim._game = state._game;
+      await saveJSON(STATE_PATH, slim).catch(() => {});
+    }).catch(() => {});
+    return _persistChain;
   };
+  const shutdown = async (sig) => {                         // §7 safe shutdown: persist once, then exit cleanly
+    if (stopping) return;
+    stopping = true;
+    log(`↩ ${sig} — persisting fleet state and shutting down cleanly…`);
+    try { await persist(); } catch {}
+    log("✓ fleet state saved. Goodbye.");
+    exitProc(0);
+  };
+  if (isDeno) { try { Deno.addSignalListener("SIGINT", () => shutdown("SIGINT")); Deno.addSignalListener("SIGTERM", () => shutdown("SIGTERM")); } catch {} }
+  else { try { process.on("SIGINT", () => shutdown("SIGINT")); process.on("SIGTERM", () => shutdown("SIGTERM")); } catch {} }
 
   // treasurer loop
   (async () => {
