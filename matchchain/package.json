@@ -1,0 +1,17 @@
+{
+  "name": "@sabha/matchchain",
+  "version": "0.1.0-rc1",
+  "description": "Chain-agnostic, transport-independent signed replay protocol",
+  "license": "MIT",
+  "main": "src/matchchain-core.js",
+  "scripts": {
+    "test": "python tools/release_gate.py"
+  },
+  "keywords": [
+    "signed-replay",
+    "deterministic",
+    "p2p",
+    "consensus",
+    "state-machine"
+  ]
+}
